@@ -1,157 +1,97 @@
 import torch
-import torch.nn as nn
+import numpy as np
 from torch.utils.data import Dataset
-import os
-import sentencepiece as spm
+from tokenizers import Tokenizer
 import random
 
-class BilingualDataset(Dataset):
-
-    def __init__(self, src_file, tgt_file, tokenizer_src, tokenizer_tgt, max_len=None, word_dropout_rate=0.1, is_train=True):
+class ViLoDataset(Dataset):
+    def __init__(self, src_file, tgt_file, src_text_file, tgt_text_file, tokenizer, max_len=None):
         super().__init__()
-        self.max_len = max_len  # Optional max length for filtering
-        self.word_dropout_rate = word_dropout_rate  # Probability of replacing a token with UNK
-        self.is_train = is_train  # Only apply word dropout during training
-
-        self.tokenizer_src = tokenizer_src
-        self.tokenizer_tgt = tokenizer_tgt
-        
-        # Get UNK token IDs
-        self.unk_token_src = tokenizer_src.piece_to_id("<unk>")
-        self.unk_token_tgt = tokenizer_tgt.piece_to_id("<unk>")
-        
-        # Load the source and target texts
-        with open(src_file, 'r', encoding='utf-8') as f:
-            self.src_texts = f.read().splitlines()
-        
-        with open(tgt_file, 'r', encoding='utf-8') as f:
-            self.tgt_texts = f.read().splitlines()
-            
-        # Ensure src and tgt have the same number of sentences
-        assert len(self.src_texts) == len(self.tgt_texts), "Source and target files must have the same number of lines"
+        self.src_data = np.memmap(src_file, dtype=np.uint16, mode='r')
+        self.tgt_data = np.memmap(tgt_file, dtype=np.uint16, mode='r')
+        with open(src_text_file, 'r', encoding='utf-8') as f:
+            self.src_texts = f.readlines()
+        with open(tgt_text_file, 'r', encoding='utf-8') as f:
+            self.tgt_texts = f.readlines()
+        self.tokenizer = tokenizer
+        self.max_len = max_len
+        self.unk_token = tokenizer.token_to_id("<unk>")
+        assert len(self.src_data) == len(self.tgt_data) == len(self.src_texts) == len(self.tgt_texts)
 
     def __len__(self):
-        return len(self.src_texts)
+        return len(self.src_data)
 
     def __getitem__(self, idx):
-        src_text = self.src_texts[idx]
-        tgt_text = self.tgt_texts[idx]
-
-        # Transform the text into tokens using SentencePiece
-        enc_input_tokens = self.tokenizer_src.encode(src_text)
-        dec_input_tokens = self.tokenizer_tgt.encode(tgt_text)
-        
-        # Apply word dropout during training
-        if self.is_train and self.word_dropout_rate > 0:
-            enc_input_tokens = self._apply_word_dropout(enc_input_tokens, self.unk_token_src)
-            
-            # Note: We don't apply word dropout to target tokens for label since it's what the model should predict
-            # But we can apply it to decoder input (what the model sees before making predictions)
-            dec_input_tokens_with_dropout = self._apply_word_dropout(dec_input_tokens.copy(), self.unk_token_tgt)
-        else:
-            dec_input_tokens_with_dropout = dec_input_tokens
-        
-        # Optional filtering of sequences that are too long
-        if self.max_len is not None:
-            if len(enc_input_tokens) > self.max_len - 2 or len(dec_input_tokens) > self.max_len - 2:
-                # Skip this example and get another one
-                idx = (idx + 1) % len(self)
-                return self[idx]
-
+        src_tokens = self.src_data[idx]
+        tgt_tokens = self.tgt_data[idx]
         return {
-            "src_tokens": enc_input_tokens,
-            "tgt_tokens": dec_input_tokens_with_dropout,  # Use version with dropout for input
-            "tgt_labels": dec_input_tokens,  # Use clean version for labels
-            "src_text": src_text,
-            "tgt_text": tgt_text,
+            "src_tokens": src_tokens.tolist(),
+            "tgt_tokens": tgt_tokens.tolist(),
+            "src_text": self.src_texts[idx].strip(),
+            "tgt_text": self.tgt_texts[idx].strip()
         }
-    
-    def _apply_word_dropout(self, tokens, unk_token_id):
-        """Randomly replace some tokens with UNK token."""
-        result = tokens.copy()
-        for i in range(len(result)):
-            if random.random() < self.word_dropout_rate:
-                result[i] = unk_token_id
-        return result
 
-def causal_mask(size):
-    # Create a causal mask of shape [1, size, size]
-    # The mask is 1 where attention is allowed, 0 where it is not
-    mask = torch.triu(torch.ones((size, size)), diagonal=1).type(torch.int)
-    return (mask == 0).unsqueeze(0)  # [1, size, size], True where allowed
+class CollateBatch:
+    def __init__(
+        self, eos_token_id,
+        src_lang_token_id,
+        tgt_lang_token_id,
+    ):
+        self.eos_token_id = eos_token_id
+        self.src_lang_token_id = src_lang_token_id
+        self.tgt_lang_token_id = tgt_lang_token_id
 
-def collate_batch(batch, tokenizer_src, tokenizer_tgt):
-    # Get special token IDs
-    sos_token_src = tokenizer_src.piece_to_id("<s>")
-    eos_token_src = tokenizer_src.piece_to_id("</s>")
-    pad_token_src = tokenizer_src.piece_to_id("<pad>")
-    
-    sos_token_tgt = tokenizer_tgt.piece_to_id("<s>")
-    eos_token_tgt = tokenizer_tgt.piece_to_id("</s>")
-    pad_token_tgt = tokenizer_tgt.piece_to_id("<pad>")
-    
-    # Get max lengths in this batch
-    max_src_len = max([len(item["src_tokens"]) for item in batch]) + 2  # +2 for SOS and EOS
-    max_tgt_len = max([len(item["tgt_tokens"]) for item in batch]) + 1  # +1 for SOS (EOS is in labels)
-    
-    # Initialize tensors for the batch
-    batch_size = len(batch)
-    encoder_inputs = torch.full((batch_size, max_src_len), pad_token_src, dtype=torch.int64)
-    decoder_inputs = torch.full((batch_size, max_tgt_len), pad_token_tgt, dtype=torch.int64)
-    labels = torch.full((batch_size, max_tgt_len), pad_token_tgt, dtype=torch.int64)
-    
-    # Prepare encoder/decoder masks (initialized to all zeros = masked)
-    encoder_masks = torch.zeros((batch_size, 1, 1, max_src_len), dtype=torch.int64)
-    
-    # Process each item in the batch
-    src_texts = []
-    tgt_texts = []
-    
-    for i, item in enumerate(batch):
-        src_tokens = item["src_tokens"]
-        tgt_tokens = item["tgt_tokens"]  # Input with word dropout
-        tgt_labels = item.get("tgt_labels", tgt_tokens)  # Labels without dropout
-        
-        src_texts.append(item["src_text"])
-        tgt_texts.append(item["tgt_text"])
-        
-        # Add SOS and EOS to source
-        src_length = len(src_tokens) + 2
-        encoder_inputs[i, 0] = sos_token_src
-        encoder_inputs[i, 1:src_length-1] = torch.tensor(src_tokens, dtype=torch.int64)
-        encoder_inputs[i, src_length-1] = eos_token_src
-        
-        # Create encoder mask (1 for tokens, 0 for padding)
-        encoder_masks[i, 0, 0, :src_length] = 1
-        
-        # Add SOS to decoder input
-        tgt_length = len(tgt_tokens) + 1
-        decoder_inputs[i, 0] = sos_token_tgt
-        decoder_inputs[i, 1:tgt_length] = torch.tensor(tgt_tokens, dtype=torch.int64)
-        
-        # Add target tokens and EOS to labels
-        labels[i, :tgt_length-1] = torch.tensor(tgt_labels, dtype=torch.int64)
-        labels[i, tgt_length-1] = eos_token_tgt
-    
-    # Create decoder masks (combining padding mask with causal mask)
-    decoder_padding_masks = (decoder_inputs != pad_token_tgt).unsqueeze(1).int()  # [batch, 1, tgt_len]
-    causal_masks = causal_mask(max_tgt_len)  # [1, tgt_len, tgt_len]
-    
-    # Combine padding mask with causal mask to get final decoder mask
-    # decoder_padding_masks: [batch, 1, tgt_len] -> [batch, 1, 1, tgt_len]
-    # causal_masks: [1, tgt_len, tgt_len] -> [1, 1, tgt_len, tgt_len]
-    decoder_padding_masks = decoder_padding_masks.unsqueeze(1)  # [batch, 1, 1, tgt_len]
-    causal_masks = causal_masks.unsqueeze(0)  # [1, 1, tgt_len, tgt_len]
-    
-    # Broadcasting: [batch, 1, 1, tgt_len] & [1, 1, tgt_len, tgt_len] -> [batch, 1, tgt_len, tgt_len]
-    decoder_masks = decoder_padding_masks & causal_masks
-    
-    return {
-        "encoder_input": encoder_inputs,
-        "decoder_input": decoder_inputs,
-        "encoder_mask": encoder_masks,
-        "decoder_mask": decoder_masks,
-        "label": labels,
-        "src_text": src_texts,
-        "tgt_text": tgt_texts,
-    }
+    def __call__(self, batch):
+        src_seqlens = [len(item["src_tokens"]) + 2 for item in batch] # +2 for EOS and tag language
+        tgt_seqlens = [len(item["tgt_tokens"]) + 2 for item in batch] # +2 for EOS and tag language
+        # Get max lengths in this batch
+        src_max_len = max(src_seqlens)
+        tgt_max_len = max(tgt_seqlens)
+        # cu_seqlen for flash attention
+        src_cu_seqlen = torch.cumsum(torch.tensor([0] + src_seqlens), dim=0)
+        tgt_cu_seqlen = torch.cumsum(torch.tensor([0] + tgt_seqlens), dim=0)
+        # position for rope when pack qkv
+        src_position_ids = torch.cat(
+            [torch.arange(l, device=src_cu_seqlen.device) for l in src_seqlens]
+        )
+        tgt_position_ids = torch.cat(
+            [torch.arange(l, device=tgt_cu_seqlen.device) for l in tgt_seqlens]
+        )
+
+        src_total_tokens = sum(src_seqlens)
+        tgt_total_tokens = sum(tgt_seqlens)
+        encoder_inputs = torch.zeros(src_total_tokens, dtype=torch.long, device=src_cu_seqlen.device)
+        decoder_inputs = torch.zeros(tgt_total_tokens, dtype=torch.long, device=tgt_cu_seqlen.device)
+        labels = torch.zeros(tgt_total_tokens, dtype=torch.long, device=tgt_cu_seqlen.device)
+        src_texts = []
+        tgt_texts = []
+        for i, item in enumerate(batch):
+            src_tokens = len(item["src_tokens"])
+            tgt_tokens = len(item["tgt_tokens"])
+
+            src = torch.tensor(
+                [self.src_lang_token_id] + item["src_tokens"] + [self.eos_token_id],
+                dtype=torch.long, device=src_cu_seqlen.device
+            )
+            tgt = torch.tensor(
+                [self.tgt_lang_token_id] + item["tgt_tokens"] + [self.eos_token_id],
+                dtype=torch.long, device=tgt_cu_seqlen.device
+            )
+            encoder_inputs[src_cu_seqlen[i]:src_cu_seqlen[i + 1]] = src
+            decoder_inputs[tgt_cu_seqlen[i]:tgt_cu_seqlen[i + 1]] = tgt[:-1]
+            labels[tgt_cu_seqlen[i]:tgt_cu_seqlen[i + 1]] = tgt[1:]
+            src_texts.append(item.get("src_text", ""))
+            tgt_texts.append(item.get("tgt_text", ""))
+        return {
+            "encoder_input": encoder_inputs,
+            "decoder_input": decoder_inputs,
+            "label": labels,
+            "src_text": src_texts,
+            "tgt_text": tgt_texts,
+            "src_cu_seqlen": src_cu_seqlen,
+            "tgt_cu_seqlen": tgt_cu_seqlen,
+            "src_position_ids": src_position_ids,
+            "tgt_position_ids": tgt_position_ids,
+            "src_max_len": src_max_len,
+            "tgt_max_len": tgt_max_len
+        }
