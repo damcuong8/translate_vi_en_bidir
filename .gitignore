@@ -3,9 +3,24 @@ __pycache__
 *.json
 runs/
 weights/
+*.env
+*.txt
+*.log
+*.csv
 
 wandb/
 
 venv/
-VLSP2023/
-kaggle/
+133k_en_vi/
+detokenization/
+nllb_eng_vie_10M.txt
+plain_text_envi.txt
+plain_text_envi_cleaned.txt
+plain_text_envi_cleaned_ftfy.txt
+char_stats_envi.txt
+char_stats_envi_cleaned.txt
+char_stats_envi_cleaned_ftfy.txt
+char_stats_envi_cleaned_ftfy_normalized.txt
+char_stats_envi_cleaned_ftfy_normalized_nfc.txt
+char_stats_envi_cleaned_ftfy_normalized_nfc_nfd.txt
+temp.ipynb

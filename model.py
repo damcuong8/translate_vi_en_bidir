@@ -1,46 +1,62 @@
+# This version of transformer is inspired by deepseek
+
 import torch
 import torch.nn as nn
+import torch.distributed as dist
 import math
 from torch.profiler import record_function
-from flash_attn.flash_attention_interface import flash_attn_unpadded_qkvpacked_func
+import torch.nn.functional as F
+from dataclasses import dataclass
+from typing import Optional
+from torch.nn.attention import sdpa_kernel, SDPBackend
+from deepspeed.moe.layer import MoE
 
 @dataclass
 class ModelConfig:
-    num_hidden_layers: int = 36
-    num_experts: int = 128
-    experts_per_token: int = 4
-    src_vocab_size: int = 201088
-    tag_vocab_size: int = 30000
-    hidden_size: int = 2880
-    intermediate_size: int = 2880
+    num_hidden_layers: int = 9
+    shared_experts: int = 1
+    num_dense_layers: int = 1
+    num_route_experts: int = 16
+    num_activated_experts: int = 2
+    vocab_size: int = 24000
+    hidden_size: int = 512
+    intermediate_size: int = 1360
+    moe_intermediate_size: int = 384
     swiglu_limit: float = 7.0
     head_dim: int = 64
-    num_attention_heads: int = 64
-    num_key_value_heads: int = 8
-    sliding_window: int = 128
-    initial_context_length: int = 4096
+    num_attention_heads: int = 8
+    num_key_value_heads: int = 1
+    initial_context_length: int = 512
     rope_theta: float = 10000.0
     rope_scaling_factor: float = 2.0
     rope_ntk_alpha: float = 1.0
-    rope_ntk_beta: float = 32.0
+    rope_ntk_beta: float = 4.0
+    initializer_range: float = 0.02
+    gate_initializer_range: float = 0.01
+    use_sdpa_kernel: bool = True
+    w_load_loss: float = 0.01
+    w_importance_loss: float = 0.01
+    w_aux_loss: float = 0.01
+    use_deepspeed_moe: bool = False
+
 
 class RMSNorm(nn.Module):
 
     def __init__(
-        self, num_features: int, eps: float = 1e-6, device: torch.device | None = None
+        self, dim: int, eps: float = 1e-6, device: torch.device | None = None
     ):
         super().__init__()
         self.eps = eps
-        self.num_features = num_features
-        self.scale = nn.Parameter(
-            torch.ones(num_features, device=device, dtype=torch.float32)
+        self.dim = dim
+        self.weight = nn.Parameter(
+            torch.ones(dim, dtype=torch.float32)
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        assert x.shape[-1] == self.num_features
+        assert x.shape[-1] == self.dim
         t, dtype = x.float(), x.dtype
-        t = t * torch.rsqrt(torch.mean(t**2, dim=-1, keepdim=True) + self.eps)
-        return (t * self.scale).to(dtype)
+        t = F.rms_norm(t, (self.dim,), self.weight, self.eps)
+        return t.to(dtype)
     
 def _apply_rotary_emb(
     x: torch.Tensor,
@@ -48,11 +64,11 @@ def _apply_rotary_emb(
     sin: torch.Tensor,
     position_ids: torch.Tensor,
 ) -> torch.Tensor:
-    cos = cos[position_ids].to(x.dtype) # (total_tokens, head_dim // 2)
+    cos = cos[position_ids].to(x.dtype) # (batch, seq_len, head_dim // 2)
     sin = sin[position_ids].to(x.dtype)
 
-    cos = cos.unsqueeze(1)  # (total_tokens, 1, head_dim // 2)
-    sin = sin.unsqueeze(1)  # (total_tokens, 1, head_dim // 2)
+    cos = cos.unsqueeze(1)  # (batch, 1, seq_len, head_dim // 2)
+    sin = sin.unsqueeze(1)  # (batch, 1, seq_len, head_dim // 2)
     
     x1, x2 = torch.chunk(x, 2, dim=-1)
 
@@ -143,6 +159,7 @@ class RotaryEmbedding(nn.Module):
 
         return query, key
 
+# TODO code switch type of sdpa FA or torch sdpa
 class AttentionBlock(nn.Module):
     def __init__(
         self,
@@ -151,15 +168,19 @@ class AttentionBlock(nn.Module):
         device: torch.device | None = None
     ):
         super().__init__()
+        self.config = config
         self.head_dim = config.head_dim
         self.hidden_size = config.hidden_size
         self.num_attention_heads = config.num_attention_heads
         self.causal_mask = causal_mask
-        self.norm = RMSNorm(config.hidden_size, device=device)
 
-        qkv_dim = 3 * config.hidden_size
-        self.qkv = (
-            nn.Linear(config.hidden_size, qkv_dim, device=device)
+
+        kv_dim = 2 * config.hidden_size
+        self.q = (
+            nn.Linear(config.hidden_size, config.hidden_size, device=device)
+        )
+        self.kv = (
+            nn.Linear(config.hidden_size, kv_dim, device=device)
         )
         self.out = nn.Linear(
             config.head_dim * config.num_attention_heads,
@@ -178,35 +199,61 @@ class AttentionBlock(nn.Module):
             device=device
         )
 
-    def forward(self, x: torch.Tensor,
-        cu_seqlens: torch.Tensor,
-        position_ids: torch.Tensor,
-        max_seqlen: int,
+    def forward(
+        self,
+        x: torch.Tensor,
+        encoder_output: torch.Tensor | None = None,
+        mask: torch.Tensor | None = None
     ) -> torch.Tensor:
-        total_tokens, hidden_size = x.shape
+        batch_size, seq_len, hidden_size = x.shape
         assert hidden_size == self.hidden_size, f"Expected hidden size {self.hidden_size}, got {hidden_size}"
-        t = self.norm(x)
-        qkv = self.qkv(t)
-        q = qkv[:, : self.hidden_size].contiguous()
-        k = qkv[:, self.hidden_size : 2 * self.hidden_size].contiguous()
-        v = qkv[:, 2 * self.hidden_size : 3 * self.hidden_size].contiguous()
+        is_cross_attention = encoder_output is not None
 
-        q = q.view(-1, self.num_attention_heads, self.head_dim)
-        k = k.view(-1, self.num_attention_heads, self.head_dim)
-        v = v.view(-1, self.num_attention_heads, self.head_dim)
+        # Generate position_ids (0 to seq_len-1) for this batch
+        position_ids = torch.arange(seq_len, device=x.device).unsqueeze(0).expand(batch_size, -1)
 
-        q, k = self.rope(q, k, position_ids) # Apply rotary embeddings
+        q = self.q(x)
+        if is_cross_attention:
+            kv = self.kv(encoder_output)
+        else:
+            kv = self.kv(x)
+        k = kv[:, :, : self.hidden_size]
+        v = kv[:, :, self.hidden_size :]
 
-        qkv = torch.stack([q, k, v], dim=1)
-        t,_ = flash_attn_unpadded_qkvpacked_func(
-            qkv, cu_seqlens = cu_seqlens,
-            max_seqlen = max_seqlen, dropout_p = 0.0,
-            causal = self.causal_mask
-        )
-        t = t.contiguous().view(-1, self.head_dim * self.num_attention_heads)
+        # Reshape for Attention: [Batch, Seq, Heads, HeadDim] -> [Batch, Heads, Seq, HeadDim]
+        q = q.view(batch_size, -1, self.num_attention_heads, self.head_dim).transpose(1, 2)
+        k = k.view(batch_size, -1, self.num_attention_heads, self.head_dim).transpose(1, 2)
+        v = v.view(batch_size, -1, self.num_attention_heads, self.head_dim).transpose(1, 2)
+        
+        if is_cross_attention:
+            q, _ = self.rope(q, q, position_ids)
+        else:
+            q, k = self.rope(q, k, position_ids)
+        
+        # Ensure causal mask is only used for self-attention
+        is_causal = self.causal_mask and not is_cross_attention
+        
+        if mask is not None:
+            # SDPA does not support is_causal=True with a mask.
+            # If we have a mask (e.g. for padding) and need causal masking,
+            # we must merge the causal mask into the provided mask.
+            if is_causal:
+                seq_len = x.shape[1]
+                causal_mask = torch.triu(torch.ones((seq_len, seq_len), device=x.device), diagonal=1).bool()
+                mask = mask | causal_mask
+            is_causal = False
+
+        if self.config.use_sdpa_kernel:
+            with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+                t = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=is_causal)
+        else:
+            t = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=is_causal)
+        
+        # Reshape back: [Batch, Heads, Seq, HeadDim] -> [Batch, Seq, Hidden]
+        t = t.transpose(1, 2).contiguous().view(batch_size, seq_len, self.head_dim * self.num_attention_heads)
         t = self.out(t)
-        t = t + x
         return t
+
 
 # TODO implement 5 trainable parameters
 def swiglu(x, alpha: float = 1.702, limit: float = 7.0) -> torch.Tensor:
@@ -216,89 +263,97 @@ def swiglu(x, alpha: float = 1.702, limit: float = 7.0) -> torch.Tensor:
     out_glu = x_glu * torch.sigmoid(x_glu * alpha)
     return out_glu + (x_linear + 1)
 
-class MLPBlock(nn.Module):
+
+class MLP(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        intermediate_dim: int
+    ):
+        super().__init__()
+        self.hidden_size = dim
+        self.intermediate_dim = intermediate_dim
+        self.mlp1 = nn.Linear(dim, intermediate_dim * 2)
+        self.mlp2 = nn.Linear(intermediate_dim, dim)
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, float]:
+        assert x.shape[-1] == self.hidden_size, f"Expected hidden size {self.hidden_size}, got {x.shape[-1]}"
+        t = swiglu(self.mlp1(x))
+        t = self.mlp2(t)
+        return t, 0.0
+
+class MOEBlock(nn.Module):
     def __init__(
         self,
         config: ModelConfig,
         device: torch.device | None = None
     ):
         super().__init__()
-        self.num_experts = config.num_experts
-        self.experts_per_token = config.experts_per_token
+
+        assert config.num_route_experts % world_size == 0, f"Number of experts must be divisible by world size (world_size={world_size})"
+        self.num_route_experts = config.num_route_experts
+        self.num_local_experts = config.num_route_experts // world_size
+        self.num_activated_experts = config.num_activated_experts
+        self.experts_start_idx = rank * self.num_local_experts
+        self.experts_end_idx = self.experts_start_idx + self.num_local_experts
         self.w_load_loss = config.w_load_loss
         self.w_importance_loss = config.w_importance_loss
         self.w_aux_loss = config.w_aux_loss
-        self.norm = RMSNorm(config.hidden_size, device=device)
         self.gate = nn.Linear(
-            config.hidden_size, config.num_experts, device=device
-        )
-        self.mlp1_weight = nn.Parameter(
-            torch.empty(
-                (
-                    config.num_experts,
-                    config.intermediate_size * 2,
-                    config.hidden_size,
-                ),
-                device=device,
-            )
-        )
-        self.mlp1_bias = nn.Parameter(
-            torch.empty(
-                (config.num_experts, config.intermediate_size * 2),
-                device=device,
-            )
+            config.hidden_size, config.num_route_experts, device=device
         )
 
-        self.mlp2_weight = nn.Parameter(
-            torch.empty(
-                (
-                    config.num_experts, 
-                    config.hidden_size,
-                    config.intermediate_size
-                ),
-                device=device,
-            )
+        self.shared_experts = MLP(
+            config.hidden_size,
+            config.moe_intermediate_size
         )
-        self.mlp2_bias = nn.Parameter(
-            torch.empty(
-                (config.num_experts, config.hidden_size),
-                device=device,
-            )
+        
+        self.experts = nn.ModuleList(
+            [
+                MLP(config.hidden_size, config.moe_intermediate_size) if self.experts_start_idx <= i < self.experts_end_idx else nn.Identity()
+                for i in range(self.num_route_experts)
+            ]
         )
+        
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        
+        shape = x.size()
+        x = x.view(-1, shape[-1])
         num_tokens, num_features = x.shape
-        t = self.norm(x)
-        gate_logits = self.gate(t)
 
-        gate_probs = torch.nn.functional.softmax(gate_logits, dim=-1)
-        expert_weights, experts_indices = torch.topk(gate_probs, self.experts_per_token, dim=-1)
+        z, _ = self.shared_experts(x)
+
+        gate_logits = self.gate(x)
+
+        gate_probs = F.softmax(gate_logits, dim=-1)
+        expert_weights, experts_indices = torch.topk(gate_probs, self.num_activated_experts, dim=-1)
         # Normalize
         expert_weights = expert_weights / expert_weights.sum(dim=-1, keepdim=True)
 
-        mlp1_weight = self.mlp1_weight[experts_indices, ...]
-        mlp1_bias = self.mlp1_bias[experts_indices, ...]
-
-        t = torch.einsum("beck,bk->bec", mlp1_weight, t) + mlp1_bias
-        t = swiglu(t, limit=self.swiglu_limit)
-        mlp2_weight = self.mlp2_weight[experts_indices, ...]
-        mlp2_bias = self.mlp2_bias[experts_indices, ...]
-
-        t = torch.einsum("beck,bek->bec", mlp2_weight, t) + mlp2_bias
-        # Weighted sum of experts
-        t = torch.einsum("bec,be->bc", t, expert_weights)
-        t = t + x
+        y = torch.zeros_like(x)
+        counts = torch.bincount(experts_indices.flatten(), minlength=self.num_route_experts).tolist()
+        for i in range(self.experts_start_idx, self.experts_end_idx):
+            if counts[i] == 0:
+                continue
+            expert = self.experts[i]
+            idx, top_expert = torch.where(experts_indices == i)
+            # expert returns tuple(tensor, float), take tensor
+            exp_out, _ = expert(x[idx])
+            y[idx] += exp_out * expert_weights[idx, top_expert]
+        
+        if world_size > 1:
+            dist.all_reduce(y)
+        output = (z + y).view(shape)
+        
         # loss_load_balancing
         P = gate_probs.mean(dim=0)
-        D = torch.zeros(self.num_experts, device=x.device)
-        for i in range(self.experts_per_token):
-            D += D.scatter_add_(
-                dim=0, index=experts_indices[:, i], src=torch.ones(num_tokens, device=x.device),
-            )
-        D = D / (num_tokens * self.experts_per_token)
-        loss_load_balancing = self.w_load_loss * self.num_experts * (P * D).sum()
+        temp_counts = torch.bincount(experts_indices.flatten(), minlength=self.num_route_experts).float()
+        D = temp_counts / (num_tokens * self.num_activated_experts)
+        loss_load_balancing = self.w_load_loss * self.num_route_experts * (P * D).sum()
+        
         # importance loss
-        importance = gate_logits.sum(dim=0)
+        importance = gate_logits.sum(dim=0) 
         importance_mean = importance.mean()
         importance_std = torch.std(importance)
         cv = (importance_std / (importance_mean + 1e-6))
@@ -308,21 +363,79 @@ class MLPBlock(nn.Module):
 
         aux_loss = self.w_aux_loss * (loss_load_balancing + importance_loss)
 
-        return t, aux_loss
+        return output, aux_loss
+
+
+class DeepSpeedMoEBlock(nn.Module):
+    def __init__(
+        self,
+        config: ModelConfig,
+        device: torch.device | None = None
+    ):
+        super().__init__()
+        
+        self.experts = nn.ModuleList([
+            MLP(config.hidden_size, config.moe_intermediate_size) 
+            for _ in range(config.num_route_experts)
+        ])
+
+        # DeepSpeed MoE Layer wrap
+        # Nó sẽ tự động xử lý Gating (Top-K) và Routing (All-to-All communication)
+        self.deepspeed_moe = MoE(
+            hidden_size=config.hidden_size,
+            expert=self.experts,
+            num_experts=config.num_route_experts,
+            ep_size=world_size, # ep_size = world_size (số GPU dùng cho Expert Parallel)
+            k=config.num_activated_experts, # Top-k <= 2
+            use_residual=False,
+            min_capacity=0,
+            noisy_gate_policy=None # Có thể chọn 'Jitter' hoặc 'RSample'
+        )
+        
+        # Shared Expert (thường DeepSeek hay dùng 1 expert chạy trên tất cả token)
+        # DeepSpeed MoE hiện tại tập trung vào routed experts. 
+        # Shared expert nên để riêng bên ngoài lớp MoE này.
+        self.shared_experts = MLP(
+            config.hidden_size, 
+            config.moe_intermediate_size
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x shape: [batch, seq_len, hidden]
+        original_shape = x.shape
+        x_flat = x.view(-1, original_shape[-1])
+        
+        # 1. Tính Shared Expert (luôn chạy trên local GPU cho mọi token)
+        shared_output, _ = self.shared_experts(x_flat)
+        
+        # 2. Tính Routed Experts qua DeepSpeed
+        # DeepSpeed MoE trả về: output, l_aux, exp_counts
+        moe_output, aux_loss, _ = self.deepspeed_moe(x_flat)
+        
+        # 3. Cộng gộp
+        final_output = shared_output + moe_output
+        
+        return final_output.view(original_shape), aux_loss
 
 class EncoderBlock(nn.Module):
     def __init__(
         self,
         config: ModelConfig,
+        layer_id: int,
         device: torch.device | None = None,
     ):
         super().__init__()
-        self.self_attention_block = AttentionBlock(config, device=device)
-        self.feed_forward_block = MLPBlock(config, device=device)
+        self.attn_norm = RMSNorm(config.hidden_size, device=device)
+        self.self_attention_block = AttentionBlock(config, causal_mask=False, device=device)
+        self.ffn_norm = RMSNorm(config.hidden_size, device=device)
+        self.feed_forward_block = MLP(config.hidden_size, config.intermediate_size) if layer_id < config.num_dense_layers else (
+            DeepSpeedMoEBlock(config, device=device) if config.use_deepspeed_moe else MOEBlock(config, device=device)
+        )
     
-    def forward(self, x, src_cu_seqlen, src_position_ids, src_max_len) -> torch.Tensor:
-        x = self.self_attention_block(x, src_cu_seqlen, src_position_ids, src_max_len)
-        x, aux_loss = self.feed_forward_block(x)
+    def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+        x = x + self.self_attention_block(self.attn_norm(x), mask=mask)
+        x_ffn, aux_loss = self.feed_forward_block(self.ffn_norm(x))
+        x = x + x_ffn
         return x, aux_loss
     
 class DecoderBlock(nn.Module):
@@ -330,20 +443,26 @@ class DecoderBlock(nn.Module):
     def __init__(
         self,
         config: ModelConfig,
+        layer_id: int,
         device: torch.device | None = None,
     ) -> None:
         super().__init__()
-        self.self_attention_block = AttentionBlock(config, device=device)
-        self.cross_attention_block = AttentionBlock(config, device=device)
-        self.feed_forward_block = MLPBlock(config, device=device)
-
-    def forward(self, x, encoder_output, tgt_cu_seqlen, tgt_position_ids, tgt_max_len):
-        x = self.self_attention_block(x, tgt_cu_seqlen, tgt_position_ids, tgt_max_len)
-        x = self.cross_attention_block(
-            x, encoder_output, encoder_output,
-            tgt_cu_seqlen, tgt_position_ids, tgt_max_len
+        self.attn_norm = RMSNorm(config.hidden_size, device=device)
+        self.self_attention_block = AttentionBlock(config, causal_mask=True, device=device)
+        self.cr_attn_norm = RMSNorm(config.hidden_size, device=device)
+        self.cross_attention_block = AttentionBlock(config, causal_mask=False, device=device)
+        self.ffn_norm = RMSNorm(config.hidden_size, device=device)
+        self.feed_forward_block = MLP(config.hidden_size, config.intermediate_size) if layer_id < config.num_dense_layers else (
+            DeepSpeedMoEBlock(config, device=device) if config.use_deepspeed_moe else MOEBlock(config, device=device)
         )
-        x, aux_loss = self.feed_forward_block(x)
+
+    def forward(self, x, encoder_output, tgt_mask: torch.Tensor | None = None, src_mask: torch.Tensor | None = None):
+        x = x + self.self_attention_block(self.attn_norm(x), mask=tgt_mask)
+        x = x + self.cross_attention_block(
+            self.cr_attn_norm(x), encoder_output, mask=src_mask
+        )
+        x_ffn, aux_loss = self.feed_forward_block(self.ffn_norm(x))
+        x = x + x_ffn
         return x, aux_loss
 
 class Encoder(nn.Module):
@@ -351,24 +470,26 @@ class Encoder(nn.Module):
     def __init__(
         self,
         config: ModelConfig,
+        embedding: Optional[nn.Embedding] = None,
         device: torch.device | None = None,
     ):
         super().__init__()
+        
         self.embedding = nn.Embedding(
-            config.src_vocab_size, config.hidden_size, device=device
-        )
-        self.encoder_block = nn.ModuleList(
-            [
-                EncoderBlock(config, device)
-                for _ in range(config.num_hidden_layers)
-            ]
-        )
+                config.vocab_size, config.hidden_size, device=device
+            )
+        if embedding is not None:
+            self.embedding.weight = embedding.weight
 
-    def forward(self, x, encoder_output, src_cu_seqlen, src_position_ids, src_max_len):
+        self.encoder_block = nn.ModuleList()
+        for layer_id in range(config.num_hidden_layers):
+            self.encoder_block.append(EncoderBlock(config, layer_id, device))
+
+    def forward(self, x, mask: torch.Tensor | None = None):
         x = self.embedding(x)
         encoder_aux_loss = 0.0
         for encoder in self.encoder_block:
-            x, aux_loss = encoder(x, encoder_output, src_cu_seqlen, src_position_ids, src_max_len)
+            x, aux_loss = encoder(x, mask=mask)
             encoder_aux_loss += aux_loss
         return x, encoder_aux_loss
 
@@ -376,28 +497,35 @@ class Decoder(nn.Module):
     def __init__(
         self,
         config: ModelConfig,
+        embedding: Optional[nn.Embedding] = None,
         device: torch.device | None = None,
     ):
         super().__init__()
         self.embedding = nn.Embedding(
-            config.tag_vocab_size, config.hidden_size, device=device
+            config.vocab_size, config.hidden_size, device=device
         )
-        self.decoder_block = nn.ModuleList(
-            [
-                EncoderBlock(config, device)
-                for _ in range(config.num_hidden_layers)
-            ]
-        )
+        if embedding is not None:
+            self.embedding.weight = embedding.weight
+            
+        self.decoder_block = nn.ModuleList()
+        for layer_id in range(config.num_hidden_layers):
+            self.decoder_block.append(DecoderBlock(config, layer_id, device))
 
-    def forward(self, x, encoder_output, tgt_cu_seqlen, tgt_position_ids, tgt_max_len):
+    def forward(self, x, encoder_output, tgt_mask: torch.Tensor | None = None, src_mask: torch.Tensor | None = None):
         x = self.embedding(x)
         decoder_aux_loss = 0.0
         for decoder in self.decoder_block:
-            x, aux_loss = decoder(x, encoder_output, tgt_cu_seqlen, tgt_position_ids, tgt_max_len)
+            x, aux_loss = decoder(x, encoder_output, tgt_mask=tgt_mask, src_mask=src_mask)
             decoder_aux_loss += aux_loss
         return x, decoder_aux_loss
 
 class Transformer(nn.Module):
+
+    _tied_weights_keys = [
+        "lm_head.weight",
+        "encoder.embedding.weight",
+        "decoder.embedding.weight",
+    ]
 
     def __init__(
         self,
@@ -405,37 +533,100 @@ class Transformer(nn.Module):
         device: torch.device | None = None,
     ):
         super().__init__()
-        self.unembedding = nn.Linear(
+
+        global world_size, rank
+        world_size = dist.get_world_size() if dist.is_initialized() else 1
+        rank = dist.get_rank() if dist.is_initialized() else 0
+
+        self.shared = self.embedding = nn.Embedding(
+                config.vocab_size, config.hidden_size, device=device
+            )
+        self.norm = RMSNorm(config.hidden_size, device=device)
+        self.lm_head = nn.Linear(
             config.hidden_size,
-            config.tag_vocab_size,
+            config.vocab_size,
             bias=False,
             device=device
         )
-        self.encoder = Encoder(config, device)
-        self.decoder = Decoder(config, device)
+        self.encoder = Encoder(config, self.shared, device)
+        self.decoder = Decoder(config, self.shared, device)
+
+        self.tie_weights()
+
+    def tie_weights(self):
+        """
+        Tie the weights of the head and the embeddings.
+        """
+        self.lm_head.weight = self.shared.weight
+        if hasattr(self.encoder, "embedding"):
+            self.encoder.embedding.weight = self.shared.weight
+        if hasattr(self.decoder, "embedding"):
+            self.decoder.embedding.weight = self.shared.weight
+    
+    def init_weights(self, config: ModelConfig):
+        std_base = config.initializer_range
+    
+        num_layers = config.num_hidden_layers
+        scaled_std = std_base / math.sqrt(2.0 * num_layers)
+
+        for name, module in self.named_modules():
+            if isinstance(module, nn.Linear):
+                use_std = std_base
+
+                is_residual_output = False
+                if "out" in name or "mlp2" in name:
+                    is_residual_output = True
+                
+                if is_residual_output:
+                    use_std = scaled_std
+                
+                if "gate" in name or "wg" in name:
+                    use_std = config.gate_initializer_range
+
+                nn.init.normal_(module.weight, mean=0.0, std=use_std)
+                
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
+            elif isinstance(module, nn.Embedding):
+                nn.init.normal_(module.weight, mean=0.0, std=std_base)
+                if module.padding_idx is not None:
+                    module.weight.data[module.padding_idx].zero_()
+
+            elif isinstance(module, RMSNorm):
+                nn.init.ones_(module.weight)
 
     def forward(
-        self, src, tgt,
-        src_cu_seqlen, tgt_cu_seqlen,
-        src_position_ids, tgt_position_ids,
-        src_max_len, tgt_max_len,
-    ):
-        encoder_output, encoder_aux_loss = self.encode(src, src_cu_seqlen, src_position_ids, src_max_len)
-        decoder_output, decoder_aux_loss = self.decode(tgt, encoder_output, tgt_cu_seqlen, tgt_position_ids, tgt_max_len)
-        logits = self.unembedding(decoder_output)
-        return logits, encoder_aux_loss, decoder_aux_loss
+        self,
+        src_input_ids: torch.LongTensor,
+        src_attention_mask: torch.LongTensor,
+        tgt_input_ids: torch.LongTensor,
+        tgt_attention_mask: torch.LongTensor,
+        labels: torch.LongTensor,
+    ) -> tuple[torch.Tensor, float, float]:
+        
+        # Prepare masks
+        # src_attention_mask: (B, S). 1=valid, 0=pad
+        # Encoder mask: (B, 1, 1, S) or broadcastable
+        src_mask = (src_attention_mask == 0).unsqueeze(1).unsqueeze(2) # (B, 1, 1, S)
+        
+        # Decoder self-attention mask: padding only
+        # AttentionBlock will handle adding causal mask if needed
+        tgt_mask = (tgt_attention_mask == 0).unsqueeze(1).unsqueeze(2)
+
+        encoder_output, encoder_aux_loss = self.encoder(src_input_ids, mask=src_mask)
+        decoder_output, decoder_aux_loss = self.decoder(tgt_input_ids, encoder_output, tgt_mask=tgt_mask, src_mask=src_mask)
+        logits = self.lm_head(self.norm(decoder_output))
+        loss_lm = F.cross_entropy(logits.view(-1, self.config.vocab_size), labels.view(-1))
+        return logits, loss_lm, encoder_aux_loss, decoder_aux_loss
 
 def build_transformer(
     config: ModelConfig,
     device: torch.device | None = None,
 ) -> Transformer:
 
-    # Create the transformer
     transformer = Transformer(config, device)
 
-    # Initialize the parameters
-    for p in transformer.parameters():
-        if p.dim() > 1:
-            nn.init.xavier_uniform_(p)
+    transformer.init_weights(config)
     
     return transformer
