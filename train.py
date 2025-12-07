@@ -109,6 +109,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--deepspeed_config", type=str, required=True)
+    parser.add_argument("--local_rank", type=int, default=0,
+                        help="local GPU rank supplied by DeepSpeed launcher")
     args = parser.parse_args()
 
     with open(args.config) as f:
