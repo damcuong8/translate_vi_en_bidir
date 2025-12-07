@@ -31,8 +31,8 @@ def get_deepspeed_config():
         "scheduler": {
             "type": "WarmupCosineLR",
             "params": {
-                "total_num_steps ": 1000,
-                "cos_min_ratio ": 0.05,
+                "total_num_steps": 1000,
+                "cos_min_ratio": 0.05,
                 "warmup_num_steps": 100
             }
         },
@@ -50,8 +50,6 @@ def get_deepspeed_config():
         },
         "wandb": {
             "enabled": True,
-            "group": "my_group",
-            "team": "my_team",
             "project": "Translate-Vi-En"
         }
     }

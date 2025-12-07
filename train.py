@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -40,6 +41,33 @@ def train_main(config: Optional[dict] = None, ds_config: Optional[dict] = None):
         collate_fn=collate_fn,
         pin_memory=True,
     )
+
+    # --- Auto-calculate Total Steps for Scheduler ---
+    if 'scheduler' in ds_config and 'params' in ds_config['scheduler']:
+        # Get world size (number of GPUs)
+        world_size = int(os.environ.get("WORLD_SIZE", 1))
+        
+        # Calculate steps per epoch
+        # len(train_dataloader) is total batches. In distributed training, work is split.
+        steps_per_epoch = len(train_dataloader) // world_size
+        
+        gradient_accumulation_steps = ds_config.get('gradient_accumulation_steps', 1)
+        
+        # Effective update steps per epoch
+        update_steps_per_epoch = steps_per_epoch // gradient_accumulation_steps
+        
+        # Total steps for training
+        total_num_steps = update_steps_per_epoch * config['num_epochs']
+        
+        # Update config
+        ds_config['scheduler']['params']['total_num_steps'] = total_num_steps
+        
+        # Optional: Set warmup to 5% of total steps
+        ds_config['scheduler']['params']['warmup_num_steps'] = int(total_num_steps * 0.05)
+        
+        print(f"Auto-configured Scheduler: World Size={world_size}, Total Steps={total_num_steps}, Warmup={ds_config['scheduler']['params']['warmup_num_steps']}")
+    # ------------------------------------------------
+
     val_dataloader = DataLoader(
         val_dataset,
         batch_size=ds_config['train_batch_size'],
@@ -60,6 +88,25 @@ def train_main(config: Optional[dict] = None, ds_config: Optional[dict] = None):
         config=ds_config,
         collate_fn=collate_fn
     )
+
+    if dist.get_rank() == 0:
+        total_params = sum(p.numel() for p in model.parameters())
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"==================================================")
+        print(f"Model Summary:")
+        print(f"  Total Parameters: {total_params:,}")
+        print(f"  Trainable Parameters: {trainable_params:,}")
+        print(f"==================================================")
+        
+        if wandb.run is not None:
+            wandb.config.update({
+                "total_params": total_params,
+                "trainable_params": trainable_params,
+                "full_config": config,
+                "ds_config": ds_config
+            }, allow_val_change=True)
+            wandb.run.summary["total_params"] = total_params
+            wandb.run.summary["trainable_params"] = trainable_params
 
     for epoch in range(config['num_epochs']):
         for step, batch in enumerate(train_dataloader):
