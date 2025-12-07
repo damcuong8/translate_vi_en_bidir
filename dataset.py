@@ -12,8 +12,8 @@ class BidirectionalDataset(Dataset):
         self.bos_id = tokenizer.bos_token_id
         self.eos_id = tokenizer.eos_token_id
         
-        self.en_token_id = tokenizer.tokens_to_ids("__eng__")
-        self.vi_token_id = tokenizer.tokens_to_ids("__vie__")
+        self.en_token_id = tokenizer.convert_tokens_to_ids("__eng__")
+        self.vi_token_id = tokenizer.convert_tokens_to_ids("__vie__")
 
     def __len__(self):
         # for bidirectional dataset, we need to return the length of the dataset * 2
