@@ -7,7 +7,7 @@ def get_deepspeed_config():
         "gradient_accumulation_steps": 2,
         "gradient_clipping": 1.0,
         "zero_optimization": {
-            "stage": 2,
+            "stage": 3,
             "allgather_bucket_size": 5e7,
             "reduce_bucket_size": 5e7,
             "offload_optimizer": {

@@ -37,9 +37,9 @@ def train_main(config: Optional[dict] = None, ds_config: Optional[dict] = None):
         train_dataset,
         batch_size=ds_config['train_batch_size'],
         shuffle=True,
-        num_workers=2,
+        num_workers=0,  # Reduced from 2 to 0 to save memory and avoid multiprocessing overhead
         collate_fn=collate_fn,
-        pin_memory=True,
+        pin_memory=False, # Disabled pin_memory to save RAM
     )
 
     # --- Auto-calculate Total Steps for Scheduler ---
@@ -72,9 +72,9 @@ def train_main(config: Optional[dict] = None, ds_config: Optional[dict] = None):
         val_dataset,
         batch_size=ds_config['train_batch_size'],
         shuffle=False,
-        num_workers=2,
+        num_workers=0, # Reduced from 2 to 0
         collate_fn=collate_fn,
-        pin_memory=True,
+        pin_memory=False, # Disabled pin_memory
     )
     model = build_transformer(
         config=ModelConfig(
