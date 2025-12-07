@@ -50,7 +50,7 @@ def train_main(config: Optional[dict] = None, ds_config: Optional[dict] = None):
     )
     model = build_transformer(
         config=ModelConfig(
-            vocab_size=tokenizer.get_vocab_size(),
+            vocab_size=tokenizer.vocab_size,
         )
     )
     model_engine, optimizer, _, _ = deepspeed.initialize(
