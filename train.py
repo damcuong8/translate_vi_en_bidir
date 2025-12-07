@@ -13,7 +13,7 @@ from typing import Optional
 from config import get_deepspeed_config, get_kaggle_config
 from model import build_transformer, ModelConfig
 from dataset import BidirectionalDataset, Collator
-from tokenizer import EnViTokenizer
+from transformers import AutoTokenizer
 
 
 def train_main(config: Optional[dict] = None, ds_config: Optional[dict] = None):
@@ -22,18 +22,16 @@ def train_main(config: Optional[dict] = None, ds_config: Optional[dict] = None):
         ds_config = get_deepspeed_config()
     if config is None:
         config = get_kaggle_config()
-    tokenizer = EnViTokenizer(lang_token_map=config['lang_token_map'])
+    tokenizer = AutoTokenizer.from_pretrained(config['tokenizer_path'])
     train_dataset = BidirectionalDataset(
-        tokenizer=tokenizer,
-        dataset_path=config['train_hf_dataset_path']
-    )
-    val_dataset = BidirectionalDataset(
-        tokenizer=tokenizer,
-        dataset_path=config['val_hf_dataset_path']
-    )
-    collate_fn = Collator(
+        dataset_path=config['train_hf_dataset_path'],
         tokenizer=tokenizer
     )
+    val_dataset = BidirectionalDataset(
+        dataset_path=config['val_hf_dataset_path'],
+        tokenizer=tokenizer
+    )
+    collate_fn = Collator(tokenizer=tokenizer)
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=ds_config['train_batch_size'],
