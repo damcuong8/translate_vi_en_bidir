@@ -63,7 +63,7 @@ def train_main(config: Optional[dict] = None, ds_config: Optional[dict] = None):
         ds_config['scheduler']['params']['total_num_steps'] = total_num_steps
         
         # Optional: Set warmup to 5% of total steps
-        ds_config['scheduler']['params']['warmup_num_steps'] = int(total_num_steps * 0.05)
+        ds_config['scheduler']['params']['warmup_num_steps'] = int(total_num_steps * 0.03)
         
         print(f"Auto-configured Scheduler: World Size={world_size}, Total Steps={total_num_steps}, Warmup={ds_config['scheduler']['params']['warmup_num_steps']}")
     # ------------------------------------------------

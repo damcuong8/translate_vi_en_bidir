@@ -59,12 +59,12 @@ class Collator:
         self.tokenizer = tokenizer
 
     def __call__(self, batch):
-        src_batch = [x["src_ids"] for x in batch]
-        tgt_batch = [x["tgt_ids"] for x in batch]
+        src_batch = [{"input_ids": x["src_ids"]} for x in batch]
+        tgt_batch = [{"input_ids": x["tgt_ids"]} for x in batch]
 
         # Padding
-        src_pad = self.tokenizer.pad(src_batch, pad_to_multiple_of=8, padding_side="right", return_attention_mask=True)
-        tgt_pad = self.tokenizer.pad(tgt_batch, pad_to_multiple_of=8, padding_side="right", return_attention_mask=True)
+        src_pad = self.tokenizer.pad(src_batch, pad_to_multiple_of=8, padding_side="right", return_attention_mask=True, return_tensors="pt")
+        tgt_pad = self.tokenizer.pad(tgt_batch, pad_to_multiple_of=8, padding_side="right", return_attention_mask=True, return_tensors="pt")
 
         # Masks
         src_mask = src_pad["attention_mask"].long()
