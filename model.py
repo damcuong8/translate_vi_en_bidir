@@ -33,7 +33,7 @@ class ModelConfig:
     rope_ntk_beta: float = 4.0
     initializer_range: float = 0.02
     gate_initializer_range: float = 0.01
-    use_sdpa_kernel: bool = True
+    use_sdpa_kernel: bool = False
     w_load_loss: float = 0.01
     w_importance_loss: float = 0.01
     w_aux_loss: float = 0.01
