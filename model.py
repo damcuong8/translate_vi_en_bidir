@@ -37,7 +37,7 @@ class ModelConfig:
     w_load_loss: float = 0.01
     w_importance_loss: float = 0.01
     w_aux_loss: float = 0.01
-    use_deepspeed_moe: bool = False
+    use_deepspeed_moe: bool = True
 
 
 class RMSNorm(nn.Module):
