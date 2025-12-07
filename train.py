@@ -1,18 +1,19 @@
+import argparse
+import json
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import deepspeed
-from config import get_deepspeed_config, get_kaggle_config
-from model import build_transformer, ModelConfig
-from dataset import BilingualDataset, Collator
-from tokenizer import EnViTokenizer
-from typing import Optional
-import deepspeed
-import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader
 from torch.nn import functional as F
 import wandb
+from typing import Optional
+
+from config import get_deepspeed_config, get_kaggle_config
+from model import build_transformer, ModelConfig
+from dataset import BidirectionalDataset, Collator
+from tokenizer import EnViTokenizer
 
 
 def train_main(config: Optional[dict] = None, ds_config: Optional[dict] = None):
@@ -22,11 +23,11 @@ def train_main(config: Optional[dict] = None, ds_config: Optional[dict] = None):
     if config is None:
         config = get_kaggle_config()
     tokenizer = EnViTokenizer(lang_token_map=config['lang_token_map'])
-    train_dataset = BilingualDataset(
+    train_dataset = BidirectionalDataset(
         tokenizer=tokenizer,
         dataset_path=config['train_hf_dataset_path']
     )
-    val_dataset = BilingualDataset(
+    val_dataset = BidirectionalDataset(
         tokenizer=tokenizer,
         dataset_path=config['val_hf_dataset_path']
     )
@@ -105,4 +106,15 @@ def train_main(config: Optional[dict] = None, ds_config: Optional[dict] = None):
         model_engine.save_checkpoint(save_dir="./checkpoints", tag=f"epoch_{epoch}", client_config=ds_config)
     wandb.finish()
 if __name__ == "__main__":
-    train_main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=str, required=True)
+    parser.add_argument("--deepspeed_config", type=str, required=True)
+    args = parser.parse_args()
+
+    with open(args.config) as f:
+        config = json.load(f)
+
+    with open(args.deepspeed_config) as f:
+        ds_config = json.load(f)
+
+    train_main(config=config, ds_config=ds_config)

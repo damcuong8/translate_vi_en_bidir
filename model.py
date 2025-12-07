@@ -487,7 +487,7 @@ class Encoder(nn.Module):
 
     def forward(self, x, mask: torch.Tensor | None = None):
         x = self.embedding(x)
-        encoder_aux_loss = 0.0
+        encoder_aux_loss = torch.tensor(0.0, device=x.device)
         for encoder in self.encoder_block:
             x, aux_loss = encoder(x, mask=mask)
             encoder_aux_loss += aux_loss
@@ -513,7 +513,7 @@ class Decoder(nn.Module):
 
     def forward(self, x, encoder_output, tgt_mask: torch.Tensor | None = None, src_mask: torch.Tensor | None = None):
         x = self.embedding(x)
-        decoder_aux_loss = 0.0
+        decoder_aux_loss = torch.tensor(0.0, device=x.device)
         for decoder in self.decoder_block:
             x, aux_loss = decoder(x, encoder_output, tgt_mask=tgt_mask, src_mask=src_mask)
             decoder_aux_loss += aux_loss

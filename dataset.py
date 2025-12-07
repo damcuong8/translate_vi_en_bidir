@@ -45,7 +45,7 @@ class BidirectionalDataset(Dataset):
         # add EOS to the end of each sentence
         src_ids = src_ids + [self.eos_id]
         
-        tgt_out = self.bos_id + tgt_ids + self.eos_id
+        tgt_out = [self.bos_id] + tgt_ids + [self.eos_id]
 
         return {
             "src_ids": torch.tensor(src_ids, dtype=torch.long),
@@ -73,7 +73,7 @@ class Collator:
         source_ids = src_pad["input_ids"]
         dec_input = tgt_pad["input_ids"][:, :-1]
         labels = tgt_pad["input_ids"][:, 1:]
-        dec_mask = tgt_mask["attention_mask"][:, :-1]
+        dec_mask = tgt_mask[:, :-1]
 
         return {
             "src_input_ids": source_ids,
