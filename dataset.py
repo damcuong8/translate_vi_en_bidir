@@ -1,5 +1,6 @@
 import torch
 import os
+import hashlib
 from torch.utils.data import Dataset
 from datasets import load_from_disk
 
@@ -8,11 +9,23 @@ class BidirectionalDataset(Dataset):
     def __init__(self, dataset_path, tokenizer, max_seq_len=512):
         self.ds = load_from_disk(dataset_path)
         
+        # Setup writable cache directory for filtering
+        # We use /tmp to avoid "Read-only file system" error on Kaggle input datasets
+        cache_dir = "/tmp/translate_vi_en_cache"
+        os.makedirs(cache_dir, exist_ok=True)
+        
+        # Create a consistent cache filename based on dataset path and parameters
+        # valid_filename_chars = "-_.() %s%s" % (string.ascii_letters, string.digits)
+        safe_name = os.path.basename(dataset_path)
+        ds_hash = hashlib.md5(dataset_path.encode()).hexdigest()[:8]
+        cache_file_name = os.path.join(cache_dir, f"filtered_{safe_name}_{ds_hash}_{max_seq_len}.arrow")
+
         # Filter sequences longer than max_seq_len
+        # We provide cache_file_name to force writing to a writable location
         self.ds = self.ds.filter(
             lambda x: (len(x["input_ids_en"]) <= max_seq_len) and (len(x["input_ids_vi"]) <= max_seq_len),
             num_proc=min(os.cpu_count(), 4),
-            load_from_cache_file=False
+            cache_file_name=cache_file_name
         )
         
         self.tokenizer = tokenizer
