@@ -62,7 +62,10 @@ def train_fsdp(config: Optional[dict] = None):
         pin_memory=True
     )
 
-    model_config = ModelConfig(vocab_size=tokenizer.vocab_size)
+    model_config = ModelConfig(
+        vocab_size=tokenizer.vocab_size,
+        initial_context_length=512
+    )
 
     model = build_transformer(config=model_config).to(local_rank)
     

@@ -25,7 +25,7 @@ class ModelConfig:
     swiglu_limit: float = 7.0
     head_dim: int = 64
     num_attention_heads: int = 8
-    initial_context_length: int = 152
+    initial_context_length: int = 256
     rope_theta: float = 10000.0
     rope_scaling_factor: float = 1.0
     rope_ntk_alpha: float = 1.0
