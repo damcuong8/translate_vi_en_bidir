@@ -561,11 +561,12 @@ class Encoder(nn.Module):
     ):
         super().__init__()
         
-        self.embedding = nn.Embedding(
+        if embedding is not None:
+            self.embedding = embedding
+        else:
+            self.embedding = nn.Embedding(
                 config.vocab_size, config.hidden_size, device=device
             )
-        if embedding is not None:
-            self.embedding.weight = embedding.weight
 
         self.encoder_block = nn.ModuleList()
         for layer_id in range(config.num_hidden_layers):
@@ -587,11 +588,12 @@ class Decoder(nn.Module):
         device: torch.device | None = None,
     ):
         super().__init__()
-        self.embedding = nn.Embedding(
-            config.vocab_size, config.hidden_size, device=device
-        )
         if embedding is not None:
-            self.embedding.weight = embedding.weight
+            self.embedding = embedding
+        else:
+            self.embedding = nn.Embedding(
+                config.vocab_size, config.hidden_size, device=device
+            )
             
         self.decoder_block = nn.ModuleList()
         for layer_id in range(config.num_hidden_layers):
