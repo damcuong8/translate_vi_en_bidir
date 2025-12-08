@@ -45,7 +45,7 @@ def train_fsdp(config: Optional[dict] = None):
     train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset, num_replicas=world_size, rank=rank)
     val_sampler = torch.utils.data.distributed.DistributedSampler(val_dataset, num_replicas=world_size, rank=rank)
 
-    num_workers = config.get('num_workers', os.cpu_count() or 1)
+    num_workers = config.get('num_workers', os.cpu_count() or 4)
 
     train_dataloader = DataLoader(
         train_dataset,
@@ -55,6 +55,7 @@ def train_fsdp(config: Optional[dict] = None):
         collate_fn=collate_fn,
         pin_memory=True,
         prefetch_factor=2 if num_workers > 0 else None
+        drop_last=True
     )
     
     val_dataloader = DataLoader(
