@@ -341,7 +341,7 @@ class MOEBlock(nn.Module):
             idx, top_expert = torch.where(experts_indices == i)
             # expert returns tuple(tensor, float), take tensor
             exp_out, _ = expert(x[idx])
-            y[idx] += exp_out * expert_weights[idx, top_expert]
+            y[idx] += exp_out * expert_weights[idx, top_expert].unsqueeze(-1)
         
         if world_size > 1:
             dist.all_reduce(y)
@@ -421,7 +421,7 @@ class FSDPMoEBlock(nn.Module):
             idx, top_expert = torch.where(experts_indices == i)
             # expert returns tuple(tensor, float), take tensor
             exp_out, _ = expert(x[idx])
-            y[idx] += exp_out * expert_weights[idx, top_expert]
+            y[idx] += exp_out * expert_weights[idx, top_expert].unsqueeze(-1)
         
         output = (z + y).view(shape)
         
