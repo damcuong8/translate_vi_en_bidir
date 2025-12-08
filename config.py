@@ -61,8 +61,6 @@ def get_kaggle_config():
     return { 
         # Training Parameters
         "num_epochs": 20,
-        "early_stopping_patience": 5,
-        "warmup_steps": 2000,
         
         # Kaggle paths (update these for your dataset)
         "tokenizer_path": "/kaggle/input/tokenizer/Tokenizer_ENVI",
@@ -164,8 +162,7 @@ class FSDPConfig:
         """Get auto wrap policy for transformer layers"""
         from model import (
             Encoder,
-            Decoder,
-            Transformer,
+            Decoder
         )
         
         from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
@@ -174,7 +171,6 @@ class FSDPConfig:
             transformer_auto_wrap_policy,
             transformer_layer_cls={
                 Encoder,
-                Decoder,
-                Transformer,
+                Decoder
             },
         )
