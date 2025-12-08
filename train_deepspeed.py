@@ -30,7 +30,7 @@ def train_deepspeed(config: Optional[dict] = None, ds_config: Optional[dict] = N
     )
     collate_fn = Collator(tokenizer=tokenizer)
 
-    num_workers = config.get('num_workers', 4)
+    num_workers = config.get('num_workers', os.cpu_count() or 1)
 
     train_dataloader = DataLoader(
         train_dataset,

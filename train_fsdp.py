@@ -6,7 +6,8 @@ import torch.optim as optim
 import torch.distributed as dist
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.utils.data import DataLoader
-from torch.cuda.amp import GradScaler, autocast
+from torch.cuda.amp import GradScaler
+from torch.amp import autocast
 import wandb
 from tqdm import tqdm
 from typing import Optional
@@ -44,7 +45,7 @@ def train_fsdp(config: Optional[dict] = None):
     train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset, num_replicas=world_size, rank=rank)
     val_sampler = torch.utils.data.distributed.DistributedSampler(val_dataset, num_replicas=world_size, rank=rank)
 
-    num_workers = config.get('num_workers', 4)
+    num_workers = config.get('num_workers', os.cpu_count() or 1)
 
     train_dataloader = DataLoader(
         train_dataset,
