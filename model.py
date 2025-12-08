@@ -37,7 +37,8 @@ class ModelConfig:
     w_load_loss: float = 0.01
     w_importance_loss: float = 0.01
     w_aux_loss: float = 0.01
-    use_deepspeed_moe: bool = True
+    use_deepspeed_moe: bool = False
+    use_fsdp_moe: bool = True
 
 
 class RMSNorm(nn.Module):
@@ -366,6 +367,84 @@ class MOEBlock(nn.Module):
         return output, aux_loss
 
 
+class FSDPMoEBlock(nn.Module):
+    def __init__(
+        self,
+        config: ModelConfig,
+        device: torch.device | None = None
+    ):
+        super().__init__()
+        self.num_route_experts = config.num_route_experts
+        self.num_activated_experts = config.num_activated_experts
+        self.w_load_loss = config.w_load_loss
+        self.w_importance_loss = config.w_importance_loss
+        self.w_aux_loss = config.w_aux_loss
+        self.gate = nn.Linear(
+            config.hidden_size, config.num_route_experts, device=device
+        )
+
+        self.shared_experts = MLP(
+            config.hidden_size,
+            config.moe_intermediate_size
+        )
+        
+        self.experts = nn.ModuleList(
+            [
+                MLP(config.hidden_size, config.moe_intermediate_size)
+                for i in range(self.num_route_experts)
+            ]
+        )
+        
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        
+        shape = x.size()
+        x = x.view(-1, shape[-1])
+        num_tokens, num_features = x.shape
+
+        z, _ = self.shared_experts(x)
+
+        gate_logits = self.gate(x)
+
+        gate_probs = F.softmax(gate_logits, dim=-1)
+        expert_weights, experts_indices = torch.topk(gate_probs, self.num_activated_experts, dim=-1)
+        # Normalize
+        expert_weights = expert_weights / expert_weights.sum(dim=-1, keepdim=True)
+
+        y = torch.zeros_like(x)
+        counts = torch.bincount(experts_indices.flatten(), minlength=self.num_route_experts).tolist()
+        
+        for i in range(self.num_route_experts):
+            if counts[i] == 0:
+                continue
+            expert = self.experts[i]
+            idx, top_expert = torch.where(experts_indices == i)
+            # expert returns tuple(tensor, float), take tensor
+            exp_out, _ = expert(x[idx])
+            y[idx] += exp_out * expert_weights[idx, top_expert]
+        
+        output = (z + y).view(shape)
+        
+        # loss_load_balancing
+        P = gate_probs.mean(dim=0)
+        temp_counts = torch.bincount(experts_indices.flatten(), minlength=self.num_route_experts).float()
+        D = temp_counts / (num_tokens * self.num_activated_experts)
+        loss_load_balancing = self.w_load_loss * self.num_route_experts * (P * D).sum()
+        
+        # importance loss
+        importance = gate_logits.sum(dim=0) 
+        importance_mean = importance.mean()
+        importance_std = torch.std(importance)
+        cv = (importance_std / (importance_mean + 1e-6))
+        importance_loss = (
+            self.w_importance_loss * (cv ** 2)
+        )
+
+        aux_loss = self.w_aux_loss * (loss_load_balancing + importance_loss)
+
+        return output, aux_loss
+
+
 class DeepSpeedMoEBlock(nn.Module):
     def __init__(
         self,
@@ -429,7 +508,9 @@ class EncoderBlock(nn.Module):
         self.self_attention_block = AttentionBlock(config, causal_mask=False, device=device)
         self.ffn_norm = RMSNorm(config.hidden_size, device=device)
         self.feed_forward_block = MLP(config.hidden_size, config.intermediate_size) if layer_id < config.num_dense_layers else (
-            DeepSpeedMoEBlock(config, device=device) if config.use_deepspeed_moe else MOEBlock(config, device=device)
+            DeepSpeedMoEBlock(config, device=device) if config.use_deepspeed_moe else (
+                FSDPMoEBlock(config, device=device) if config.use_fsdp_moe else MOEBlock(config, device=device)
+            )
         )
     
     def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
@@ -453,7 +534,9 @@ class DecoderBlock(nn.Module):
         self.cross_attention_block = AttentionBlock(config, causal_mask=False, device=device)
         self.ffn_norm = RMSNorm(config.hidden_size, device=device)
         self.feed_forward_block = MLP(config.hidden_size, config.intermediate_size) if layer_id < config.num_dense_layers else (
-            DeepSpeedMoEBlock(config, device=device) if config.use_deepspeed_moe else MOEBlock(config, device=device)
+            DeepSpeedMoEBlock(config, device=device) if config.use_deepspeed_moe else (
+                FSDPMoEBlock(config, device=device) if config.use_fsdp_moe else MOEBlock(config, device=device)
+            )
         )
 
     def forward(self, x, encoder_output, tgt_mask: torch.Tensor | None = None, src_mask: torch.Tensor | None = None):
