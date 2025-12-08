@@ -29,13 +29,17 @@ def train_deepspeed(config: Optional[dict] = None, ds_config: Optional[dict] = N
         tokenizer=tokenizer
     )
     collate_fn = Collator(tokenizer=tokenizer)
+
+    num_workers = config.get('num_workers', 4)
+
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=ds_config['train_batch_size'],
         shuffle=True,
-        num_workers=0,  # Reduced from 2 to 0 to save memory and avoid multiprocessing overhead
+        num_workers=num_workers,
         collate_fn=collate_fn,
-        pin_memory=False, # Disabled pin_memory to save RAM
+        pin_memory=True,
+        prefetch_factor=2 if num_workers > 0 else None
     )
 
     # --- Auto-calculate Total Steps for Scheduler ---
@@ -68,14 +72,20 @@ def train_deepspeed(config: Optional[dict] = None, ds_config: Optional[dict] = N
         val_dataset,
         batch_size=ds_config['train_batch_size'],
         shuffle=False,
-        num_workers=0, # Reduced from 2 to 0
+        num_workers=num_workers,
         collate_fn=collate_fn,
-        pin_memory=False, # Disabled pin_memory
+        pin_memory=True,
+        prefetch_factor=2 if num_workers > 0 else None
     )
+    
+    model_config = ModelConfig(vocab_size=tokenizer.vocab_size)
+    # Update model_config with values from config if they exist
+    for key, value in config.items():
+        if hasattr(model_config, key):
+            setattr(model_config, key, value)
+
     model = build_transformer(
-        config=ModelConfig(
-            vocab_size=tokenizer.vocab_size,
-        )
+        config=model_config
     )
     model_engine, optimizer, _, _ = deepspeed.initialize(
         model=model,

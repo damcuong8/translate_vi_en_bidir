@@ -81,11 +81,12 @@ def get_kaggle_config():
 
         # Training Config
         "use_fsdp": True,
-        "train_batch_size": 16,
-        "val_batch_size": 16,
-        "test_batch_size": 16,
-        "dev_flores_batch_size": 16,
-        "test_flores_batch_size": 16,
+        "train_batch_size": 48,
+        "val_batch_size": 48,
+        "test_batch_size": 48,
+        "dev_flores_batch_size": 48,
+        "test_flores_batch_size": 48,
+        "num_workers": 4,
         "experiment_name": "runs/envi_model_kaggle",
 
         "optimizer": {

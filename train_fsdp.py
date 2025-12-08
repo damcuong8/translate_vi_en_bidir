@@ -35,7 +35,7 @@ def train_fsdp(config: Optional[dict] = None):
         tokenizer=tokenizer
     )
     val_dataset = BidirectionalDataset(
-        dataset_path=config['val_hf_dataset_path'],
+        dataset_path=config['val_flores_hf_dataset_path'],
         tokenizer=tokenizer
     )
     collate_fn = Collator(tokenizer=tokenizer)
@@ -44,25 +44,33 @@ def train_fsdp(config: Optional[dict] = None):
     train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset, num_replicas=world_size, rank=rank)
     val_sampler = torch.utils.data.distributed.DistributedSampler(val_dataset, num_replicas=world_size, rank=rank)
 
+    num_workers = config.get('num_workers', 4)
+
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=config['train_batch_size'],
         sampler=train_sampler,
-        num_workers=2,
+        num_workers=num_workers,
         collate_fn=collate_fn,
-        pin_memory=True
+        pin_memory=True,
+        prefetch_factor=2 if num_workers > 0 else None
     )
     
     val_dataloader = DataLoader(
         val_dataset,
         batch_size=config['val_batch_size'],
         sampler=val_sampler,
-        num_workers=2,
+        num_workers=num_workers,
         collate_fn=collate_fn,
-        pin_memory=True
+        pin_memory=True,
+        prefetch_factor=2 if num_workers > 0 else None
     )
 
     model_config = ModelConfig(vocab_size=tokenizer.vocab_size)
+    # Update model_config with values from config if they exist
+    for key, value in config.items():
+        if hasattr(model_config, key):
+            setattr(model_config, key, value)
 
     model = build_transformer(config=model_config).to(local_rank)
     

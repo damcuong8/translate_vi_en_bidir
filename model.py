@@ -35,7 +35,7 @@ class ModelConfig:
     use_sdpa_kernel: bool = False
     w_load_loss: float = 0.01
     w_importance_loss: float = 0.01
-    w_aux_loss: float = 0.01
+    w_aux_loss: float = 0.001
     use_deepspeed_moe: bool = False
     use_fsdp_moe: bool = True
 

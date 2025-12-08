@@ -99,7 +99,8 @@ class Collator:
         
         source_ids = src_pad["input_ids"]
         dec_input = tgt_pad["input_ids"][:, :-1]
-        labels = tgt_pad["input_ids"][:, 1:]
+        labels = tgt_pad["input_ids"][:, 1:].clone()
+        labels[tgt_mask[:, 1:] == 0] = -100
         dec_mask = tgt_mask[:, :-1]
 
         return {
