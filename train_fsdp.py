@@ -102,11 +102,12 @@ def train_fsdp(config: Optional[dict] = None):
     save_total_limit = config.get('save_total_limit', 3)
     
     if rank == 0:
-        if config.get("wandb", {}).get("enabled", True):
-            print(f"Initializing wandb project: {config['wandb'].get('project', 'Translate-Vi-En')}")
+        wandb_config = config.get("wandb", {})
+        if wandb_config.get("enabled", True):
+            print(f"Initializing wandb project: {wandb_config.get('project', 'Translate-Vi-En')}")
             wandb.init(
-                project=config["wandb"].get("project", "Translate-Vi-En"),
-                name=config["wandb"].get("name", "fsdp_run"),
+                project=wandb_config.get("project", "Translate-Vi-En"),
+                name=wandb_config.get("name", "fsdp_run"),
                 config=config
             )
         print(f"==================================================")
