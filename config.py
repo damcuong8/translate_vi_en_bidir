@@ -4,6 +4,7 @@ from typing import Optional
 import torch
 from torch.distributed.fsdp import ShardingStrategy
 from torch.distributed.fsdp.fully_sharded_data_parallel import MixedPrecision
+from functools import partial
 
 
 def get_deepspeed_config():
