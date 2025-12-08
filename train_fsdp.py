@@ -16,6 +16,7 @@ from dataset import BidirectionalDataset, Collator
 from transformers import AutoTokenizer
 from utils import wrap_model_with_fsdp, create_cosine_scheduler
 from checkpoint_utils import save_checkpoint_simple, save_checkpoint
+from contextlib import nullcontext
 
 def train_fsdp(config: Optional[dict] = None):
     # Setup distributed
@@ -66,6 +67,7 @@ def train_fsdp(config: Optional[dict] = None):
     model = build_transformer(config=model_config).to(local_rank)
     
     model = wrap_model_with_fsdp(model, config)
+    fsdp_model = model
 
     if rank == 0:
         print(f"Model wrapped with FSDP: \n{model}")
@@ -170,25 +172,30 @@ def train_fsdp(config: Optional[dict] = None):
         for step, batch in enumerate(train_pbar):
             batch = {k: v.to(local_rank) for k, v in batch.items()}
             
-            # Forward pass with AMP autocast
-            with autocast(dtype=amp_dtype, enabled=use_amp):
-                logits, loss_lm, enc_aux_loss, dec_aux_loss = model(
-                    batch['src_input_ids'], 
-                    batch['src_attention_mask'], 
-                    batch['tgt_input_ids'], 
-                    batch['tgt_attention_mask'], 
-                    batch['labels']
-                )
-                total_loss = loss_lm + enc_aux_loss + dec_aux_loss
-                # Scale loss for gradient accumulation
-                scaled_loss = total_loss / gradient_accumulation_steps
+            # Determine if we are accumulating gradients (no sync)
+            is_accumulating = (step + 1) % gradient_accumulation_steps != 0
             
-            # Backward pass with GradScaler
-            scaler.scale(scaled_loss).backward()
+            with fsdp_model.no_sync() if is_accumulating else nullcontext():
+                # Forward pass with AMP autocast
+                with autocast(dtype=amp_dtype, enabled=use_amp):
+                    logits, loss_lm, enc_aux_loss, dec_aux_loss = model(
+                        batch['src_input_ids'], 
+                        batch['src_attention_mask'], 
+                        batch['tgt_input_ids'], 
+                        batch['tgt_attention_mask'], 
+                        batch['labels']
+                    )
+                    total_loss = loss_lm + enc_aux_loss + dec_aux_loss
+                    # Scale loss for gradient accumulation
+                    scaled_loss = total_loss / gradient_accumulation_steps
+                
+                # Backward pass with GradScaler
+                scaler.scale(scaled_loss).backward()
+            
             accumulated_loss += total_loss
             
             # Perform optimizer step after accumulation
-            if (step + 1) % gradient_accumulation_steps == 0:
+            if not is_accumulating:
                 # Unscale gradients before clipping
                 scaler.unscale_(optimizer)
                 
