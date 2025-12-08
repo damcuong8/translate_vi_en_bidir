@@ -66,6 +66,16 @@ def train_fsdp(config: Optional[dict] = None):
     
     model = wrap_model_with_fsdp(model, config)
 
+    if rank == 0:
+        print(f"Model wrapped with FSDP: \n{model}")
+        print(f"Shared embedding weight pointer: {id(model.shared.weight)}")
+        if hasattr(model.encoder, "embedding"):
+             print(f"Encoder embedding weight pointer: {id(model.encoder.embedding.weight)}")
+        if hasattr(model.decoder, "embedding"):
+             print(f"Decoder embedding weight pointer: {id(model.decoder.embedding.weight)}")
+        print(f"LM Head weight pointer: {id(model.lm_head.weight)}")
+
+
     if config['use_torch_compile']:
         model = torch.compile(model)
         print("Model compiled with torch.compile")
@@ -92,7 +102,7 @@ def train_fsdp(config: Optional[dict] = None):
     save_total_limit = config.get('save_total_limit', 3)
     
     if rank == 0:
-        if config.get("wandb", {}).get("enabled", False):
+        if config.get("wandb", {}).get("enabled", True):
             print(f"Initializing wandb project: {config['wandb'].get('project', 'Translate-Vi-En')}")
             wandb.init(
                 project=config["wandb"].get("project", "Translate-Vi-En"),
