@@ -60,7 +60,7 @@ def wrap_model_with_fsdp(model: nn.Module, config: dict) -> nn.Module:
         sharding_strategy=sharding_strategy,
         auto_wrap_policy=auto_wrap_policy,
         mixed_precision=mixed_precision_policy,
-        backward_prefetch=BackwardPrefetch.BACKWARD_POST,
+        backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
         cpu_offload=cpu_offload_config,
         device_id=torch.cuda.current_device(),
         limit_all_gathers=True,

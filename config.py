@@ -68,7 +68,7 @@ def get_kaggle_config():
         "train_hf_dataset_path": "/kaggle/input/pho-mt-token-text/pho_mt_full/train",
         "val_hf_dataset_path": "/kaggle/input/pho-mt-token-text/pho_mt_full/dev",
         "test_hf_dataset_path": "/kaggle/input/pho-mt-token-text/pho_mt_full/test",
-        "dev_flores_hf_dataset_path": "/kaggle/input/flores-tokenized-text/flores_tokenized/flores_dev",
+        "val_flores_hf_dataset_path": "/kaggle/input/flores-tokenized-text/flores_tokenized/flores_dev",
         "test_flores_hf_dataset_path": "/kaggle/input/flores-tokenized-text/flores_tokenized/flores_devtest",
         "experiment_name": "runs/envi_model_kaggle",
         "checkpoint_path": "/kaggle/working/checkpoints",
