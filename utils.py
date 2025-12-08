@@ -2,6 +2,7 @@ import os
 import math
 import torch
 import torch.nn as nn
+import torch.distributed as dist
 import torch.optim as optim
 import torch.optim.lr_scheduler as lr_scheduler
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -19,7 +20,7 @@ def wrap_model_with_fsdp(model: nn.Module, config: dict) -> nn.Module:
     Returns:
         FSDP-wrapped model (or original model if FSDP not enabled)
     """
-    if not config['use_fsdp'] or config['world_size'] == 1:
+    if not config['use_fsdp'] or dist.get_world_size() == 1:
         print("FSDP not enabled or single GPU training, returning unwrapped model")
         return model
     
