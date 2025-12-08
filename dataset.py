@@ -8,6 +8,8 @@ from datasets import load_from_disk
 class BidirectionalDataset(Dataset):
     def __init__(self, dataset_path, tokenizer, max_seq_len=152):
         self.ds = load_from_disk(dataset_path)
+        original_count = len(self.ds)
+        print(f"Original dataset count: {original_count}")
         
         # Setup writable cache directory for filtering
         # We use /tmp to avoid "Read-only file system" error on Kaggle input datasets
@@ -27,6 +29,9 @@ class BidirectionalDataset(Dataset):
             num_proc=min(os.cpu_count(), 4),
             cache_file_name=cache_file_name
         )
+        filtered_count = len(self.ds)
+        print(f"Filtered dataset count: {filtered_count}")
+        print(f"Removed {original_count - filtered_count} samples due to length > {max_seq_len}")
         
         self.tokenizer = tokenizer
         self.real_len = len(self.ds)
