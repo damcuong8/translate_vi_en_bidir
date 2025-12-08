@@ -186,7 +186,7 @@ def train_fsdp(config: Optional[dict] = None):
             
             with fsdp_model.no_sync() if is_accumulating else nullcontext():
                 # Forward pass with AMP autocast
-                with autocast(dtype=amp_dtype, enabled=use_amp):
+                with autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
                     logits, loss_lm, enc_aux_loss, dec_aux_loss = model(
                         batch['src_input_ids'], 
                         batch['src_attention_mask'], 
@@ -277,7 +277,7 @@ def train_fsdp(config: Optional[dict] = None):
                 batch = {k: v.to(local_rank) for k, v in batch.items()}
                 
                 # Use autocast for validation too
-                with autocast(dtype=amp_dtype, enabled=use_amp):
+                with autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
                     logits, loss_lm, enc_aux_loss, dec_aux_loss = model(
                         batch['src_input_ids'], 
                         batch['src_attention_mask'], 
