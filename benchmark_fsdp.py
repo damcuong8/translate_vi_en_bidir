@@ -31,7 +31,7 @@ def benchmark_memory_fsdp(config: Optional[dict] = None):
     
     # Use a fixed large vocab size or from config
     # Loading tokenizer just for vocab size might be slow/failed if path invalid, so use config or default
-    vocab_size = config.get('vocab_size', 32000) 
+    vocab_size = config.get('vocab_size', 24000) 
     
     if rank == 0:
         print(f"Starting FSDP Memory Benchmark on Rank {rank}")
@@ -49,8 +49,8 @@ def benchmark_memory_fsdp(config: Optional[dict] = None):
     optimizer = optim.AdamW(model.parameters(), lr=1e-4)
     scaler = GradScaler(enabled=config.get('use_amp', True))
     
-    batch_sizes = [16, 32, 64, 128]
-    seq_len = 152
+    batch_sizes = [128]
+    seq_len = 160
     steps = 20
     
     # AMP settings
