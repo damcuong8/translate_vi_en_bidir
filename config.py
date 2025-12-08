@@ -170,7 +170,8 @@ class FSDPConfig:
         """Get auto wrap policy for transformer layers"""
         from model import (
             EncoderBlock,
-            DecoderBlock
+            DecoderBlock,
+            Transformer
         )
         import torch.nn as nn
         
@@ -179,8 +180,6 @@ class FSDPConfig:
         return partial(
             transformer_auto_wrap_policy,
             transformer_layer_cls={
-                EncoderBlock,
-                DecoderBlock,
-                nn.Embedding
+                Transformer
             },
         )
