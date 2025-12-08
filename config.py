@@ -169,8 +169,8 @@ class FSDPConfig:
     def get_auto_wrap_policy():
         """Get auto wrap policy for transformer layers"""
         from model import (
-            Encoder,
-            Decoder
+            EncoderLayer,
+            DecoderLayer
         )
         
         from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
@@ -178,7 +178,7 @@ class FSDPConfig:
         return partial(
             transformer_auto_wrap_policy,
             transformer_layer_cls={
-                Encoder,
-                Decoder
+                EncoderLayer,
+                DecoderLayer
             },
         )
