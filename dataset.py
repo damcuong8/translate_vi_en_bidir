@@ -1,11 +1,19 @@
 import torch
+import os
 from torch.utils.data import Dataset
 from datasets import load_from_disk
 
 
 class BidirectionalDataset(Dataset):
-    def __init__(self, dataset_path, tokenizer):
+    def __init__(self, dataset_path, tokenizer, max_seq_len=512):
         self.ds = load_from_disk(dataset_path)
+        
+        # Filter sequences longer than max_seq_len
+        self.ds = self.ds.filter(
+            lambda x: (len(x["input_ids_en"]) <= max_seq_len) and (len(x["input_ids_vi"]) <= max_seq_len),
+            num_proc=min(os.cpu_count(), 4)
+        )
+        
         self.tokenizer = tokenizer
         self.real_len = len(self.ds)
         
