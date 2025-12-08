@@ -164,6 +164,67 @@ def train_fsdp(config: Optional[dict] = None):
                  "config": config
              }, allow_val_change=True)
 
+    # Evaluation config
+    eval_steps = config.get('eval_steps', 1000)
+
+    def run_validation(curr_epoch, curr_step, is_end_of_epoch=False):
+        model.eval()
+        
+        # Create tqdm progress bar for validation
+        desc = f"Epoch {curr_epoch} [Val]" if is_end_of_epoch else f"Step {curr_step} [Val]"
+        val_pbar = tqdm(
+            val_dataloader,
+            desc=desc,
+            disable=rank != 0
+        )
+        
+        val_losses = []
+        with torch.no_grad():
+            for step, batch in enumerate(val_pbar):
+                batch = {k: v.to(local_rank) for k, v in batch.items()}
+                
+                # Use autocast for validation too
+                with autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
+                    logits, loss_lm, enc_aux_loss, dec_aux_loss = model(
+                        batch['src_input_ids'], 
+                        batch['src_attention_mask'], 
+                        batch['tgt_input_ids'], 
+                        batch['tgt_attention_mask'], 
+                        batch['labels']
+                    )
+                    total_loss = loss_lm + enc_aux_loss + dec_aux_loss
+                
+                val_losses.append(total_loss.item())
+                
+                # Update tqdm progress bar
+                val_pbar.set_postfix({'eval_loss': f'{total_loss.item():.4f}'})
+                
+                # Log periodically during validation
+                if rank == 0 and step % 10 == 0:
+                    if wandb.run is not None:
+                        wandb.log({
+                            "eval_loss": total_loss.item(),
+                            "eval_loss_lm": loss_lm.item(),
+                            "eval_enc_aux_loss": enc_aux_loss.item(),
+                            "eval_dec_aux_loss": dec_aux_loss.item(),
+                            "eval_step": step,
+                            "eval_epoch": curr_epoch
+                        })
+        
+        # Log average validation loss
+        avg_val_loss = sum(val_losses) / len(val_losses) if val_losses else 0
+        if rank == 0:
+            print(f"{desc} | Avg Validation Loss: {avg_val_loss:.4f}")
+            if wandb.run is not None:
+                log_data = {
+                    "avg_eval_loss": avg_val_loss,
+                    "epoch": curr_epoch,
+                    "global_step": curr_step
+                }
+                wandb.log(log_data)
+        
+        model.train()
+
     global_step = 0
     for epoch in range(config['num_epochs']):
         train_sampler.set_epoch(epoch)
@@ -261,58 +322,13 @@ def train_fsdp(config: Optional[dict] = None):
                 #     if dist.is_available() and dist.is_initialized():
                 #         dist.barrier()
                 
+                # Evaluate at regular intervals
+                if global_step > 0 and global_step % eval_steps == 0:
+                    run_validation(epoch, global_step)
+
                 accumulated_loss = 0.0
         
-        model.eval()
-        
-        # Create tqdm progress bar for validation
-        val_pbar = tqdm(
-            val_dataloader,
-            desc=f"Epoch {epoch} [Val]",
-            disable=rank != 0
-        )
-        
-        val_losses = []
-        with torch.no_grad():
-            for step, batch in enumerate(val_pbar):
-                batch = {k: v.to(local_rank) for k, v in batch.items()}
-                
-                # Use autocast for validation too
-                with autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
-                    logits, loss_lm, enc_aux_loss, dec_aux_loss = model(
-                        batch['src_input_ids'], 
-                        batch['src_attention_mask'], 
-                        batch['tgt_input_ids'], 
-                        batch['tgt_attention_mask'], 
-                        batch['labels']
-                    )
-                    total_loss = loss_lm + enc_aux_loss + dec_aux_loss
-                
-                val_losses.append(total_loss.item())
-                
-                # Update tqdm progress bar
-                val_pbar.set_postfix({'eval_loss': f'{total_loss.item():.4f}'})
-                
-                if rank == 0 and step % 10 == 0:
-                    if wandb.run is not None:
-                        wandb.log({
-                            "eval_loss": total_loss.item(),
-                            "eval_loss_lm": loss_lm.item(),
-                            "eval_enc_aux_loss": enc_aux_loss.item(),
-                            "eval_dec_aux_loss": dec_aux_loss.item(),
-                            "eval_step": step,
-                            "eval_epoch": epoch
-                        })
-        
-        # Log average validation loss
-        avg_val_loss = sum(val_losses) / len(val_losses) if val_losses else 0
-        if rank == 0:
-            print(f"Epoch {epoch} | Avg Validation Loss: {avg_val_loss:.4f}")
-            if wandb.run is not None:
-                wandb.log({
-                    "avg_eval_loss": avg_val_loss,
-                    "epoch": epoch
-                })
+        run_validation(epoch, global_step, is_end_of_epoch=True)
         
         # Save checkpoint at end of epoch
         save_checkpoint(
