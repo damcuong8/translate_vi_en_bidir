@@ -153,7 +153,7 @@ def _cleanup_old_checkpoints(
     
     # Extract step numbers and sort
     def get_step(path):
-        match = re.search(r'checkpoint-(\d+)', os.path.basename(path))
+        match = re.search(r'checkpoint-(?:epoch-)?(\d+)', os.path.basename(path))
         return int(match.group(1)) if match else 0
     
     checkpoint_dirs.sort(key=get_step, reverse=True)
@@ -248,6 +248,7 @@ def save_checkpoint(
     stage: Optional[str] = None,
     dataloader=None,
     global_step: Optional[int] = None,
+    tag: Optional[str] = None,
 ):
     """
     DCP + Stateful-aware checkpoint saver.
@@ -323,8 +324,13 @@ def save_checkpoint(
 
     # checkpoint directory for this step
     # Use global_step if available, otherwise use step (step_in_stage)
-    checkpoint_step = global_step if global_step is not None else step
-    checkpoint_dir = os.path.join(base_checkpoint_dir, f"checkpoint-{checkpoint_step}")
+    if tag:
+        checkpoint_dirname = f"checkpoint-{tag}"
+    else:
+        checkpoint_step = global_step if global_step is not None else step
+        checkpoint_dirname = f"checkpoint-{checkpoint_step}"
+    
+    checkpoint_dir = os.path.join(base_checkpoint_dir, checkpoint_dirname)
     os.makedirs(base_checkpoint_dir, exist_ok=True)
 
     # Cleanup existing checkpoint directory if it exists (may be corrupted from previous failed save)
@@ -517,6 +523,7 @@ def save_checkpoint_simple(
     config: dict,
     rank: int,
     avg_loss: Optional[float] = None,
+    tag: Optional[str] = None,
 ):
     """
     Simple checkpoint saver for non-DCP scenarios (single GPU or basic distributed).
@@ -528,7 +535,10 @@ def save_checkpoint_simple(
     checkpoint_dir = config.get('checkpoint_path', './checkpoints')
     os.makedirs(checkpoint_dir, exist_ok=True)
     
-    checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint-{global_step}.pt")
+    if tag:
+        checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint-{tag}.pt")
+    else:
+        checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint-{global_step}.pt")
     
     checkpoint = {
         "model": model.state_dict(),
@@ -551,7 +561,7 @@ def save_checkpoint_simple(
     if save_total_limit:
         checkpoint_files = sorted(
             glob.glob(os.path.join(checkpoint_dir, "checkpoint-*.pt")),
-            key=lambda x: int(re.search(r'checkpoint-(\d+)', x).group(1)) if re.search(r'checkpoint-(\d+)', x) else 0,
+            key=lambda x: int(re.search(r'checkpoint-(?:epoch-)?(\d+)', x).group(1)) if re.search(r'checkpoint-(?:epoch-)?(\d+)', x) else 0,
             reverse=True
         )
         for old_ckpt in checkpoint_files[save_total_limit:]:
@@ -609,7 +619,7 @@ def find_latest_checkpoint(checkpoint_dir: str) -> Optional[str]:
     
     # Sort by step number (descending)
     def get_step(path):
-        match = re.search(r'checkpoint-(\d+)', os.path.basename(path))
+        match = re.search(r'checkpoint-(?:epoch-)?(\d+)', os.path.basename(path))
         return int(match.group(1)) if match else 0
     
     checkpoint_files.sort(key=get_step, reverse=True)
