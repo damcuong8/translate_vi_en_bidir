@@ -180,6 +180,7 @@ class FSDPConfig:
         return partial(
             transformer_auto_wrap_policy,
             transformer_layer_cls={
-                Transformer: (EncoderBlock, DecoderBlock)
+                EncoderBlock,
+                DecoderBlock
             },
         )
