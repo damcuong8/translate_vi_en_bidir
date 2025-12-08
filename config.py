@@ -172,6 +172,7 @@ class FSDPConfig:
             EncoderBlock,
             DecoderBlock
         )
+        import torch.nn as nn
         
         from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
         
@@ -179,6 +180,7 @@ class FSDPConfig:
             transformer_auto_wrap_policy,
             transformer_layer_cls={
                 EncoderBlock,
-                DecoderBlock
+                DecoderBlock,
+                nn.Embedding
             },
         )
