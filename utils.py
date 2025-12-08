@@ -96,7 +96,8 @@ def create_cosine_scheduler(
     def lr_lambda(step: int):
         # warmup phase: linear 0 -> 1
         if step < warmup_steps:
-            multiplier = float(step) / float(max(1, warmup_steps))
+            # Start from step + 1 to avoid 0 LR at step 0
+            multiplier = float(step + 1) / float(max(1, warmup_steps))
             return multiplier
         # cosine decay phase: 1 -> min_lr_ratio
         progress = float(step - warmup_steps) / float(max(1, num_training_steps - warmup_steps))

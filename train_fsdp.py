@@ -14,7 +14,7 @@ from model import build_transformer, ModelConfig
 from dataset import BidirectionalDataset, Collator
 from transformers import AutoTokenizer
 from utils import wrap_model_with_fsdp, create_cosine_scheduler
-from checkpoint_utils import save_checkpoint_simple
+from checkpoint_utils import save_checkpoint_simple, save_checkpoint
 
 def train_fsdp(config: Optional[dict] = None):
     # Setup distributed
@@ -93,6 +93,7 @@ def train_fsdp(config: Optional[dict] = None):
     
     if rank == 0:
         if config.get("wandb", {}).get("enabled", False):
+            print(f"Initializing wandb project: {config['wandb'].get('project', 'Translate-Vi-En')}")
             wandb.init(
                 project=config["wandb"].get("project", "Translate-Vi-En"),
                 name=config["wandb"].get("name", "fsdp_run"),
@@ -211,6 +212,16 @@ def train_fsdp(config: Optional[dict] = None):
                         dist.barrier()
                 
                 accumulated_loss = 0.0
+
+            save_checkpoint(
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                scaler=scaler,
+                epoch=epoch,
+                global_step=global_step,
+                config=config,
+            )
         
         model.eval()
         

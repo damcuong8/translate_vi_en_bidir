@@ -25,11 +25,11 @@ class ModelConfig:
     swiglu_limit: float = 7.0
     head_dim: int = 64
     num_attention_heads: int = 8
-    initial_context_length: int = 512
+    initial_context_length: int = 152
     rope_theta: float = 10000.0
-    rope_scaling_factor: float = 2.0
+    rope_scaling_factor: float = 1.0
     rope_ntk_alpha: float = 1.0
-    rope_ntk_beta: float = 4.0
+    rope_ntk_beta: float = 1.0
     initializer_range: float = 0.02
     gate_initializer_range: float = 0.01
     use_sdpa_kernel: bool = False

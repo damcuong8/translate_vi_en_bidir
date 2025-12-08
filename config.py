@@ -122,7 +122,7 @@ def get_kaggle_config():
         
         # FSDP Config
         "sharding_strategy": "SHARD_GRAD_OP",
-        "cpu_offload": False,
+        "cpu_offload": True,
         "use_mixed_precision": False,
         "mixed_precision_dtype": "fp16",
         "use_torch_compile": True,
@@ -169,8 +169,8 @@ class FSDPConfig:
     def get_auto_wrap_policy():
         """Get auto wrap policy for transformer layers"""
         from model import (
-            EncoderBlock,
-            DecoderBlock
+            Encoder,
+            Decoder
         )
         
         from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
@@ -178,7 +178,7 @@ class FSDPConfig:
         return partial(
             transformer_auto_wrap_policy,
             transformer_layer_cls={
-                EncoderBlock,
-                DecoderBlock
+                Encoder,
+                Decoder
             },
         )

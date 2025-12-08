@@ -6,7 +6,7 @@ from datasets import load_from_disk
 
 
 class BidirectionalDataset(Dataset):
-    def __init__(self, dataset_path, tokenizer, max_seq_len=512):
+    def __init__(self, dataset_path, tokenizer, max_seq_len=152):
         self.ds = load_from_disk(dataset_path)
         
         # Setup writable cache directory for filtering
