@@ -52,7 +52,8 @@ def get_deepspeed_config():
         },
         "wandb": {
             "enabled": True,
-            "project": "Translate-Vi-En"
+            "project": "Translate-Vi-En",
+            "name": "deepspeed_run"
         }
     }
 
@@ -124,7 +125,14 @@ def get_kaggle_config():
         "cpu_offload": False,
         "use_mixed_precision": False,
         "mixed_precision_dtype": "fp16",
-        "use_torch_compile": True
+        "use_torch_compile": True,
+        
+        # Wandb Config
+        "wandb": {
+            "enabled": True,
+            "project": "Translate-Vi-En",
+            "name": "fsdp_run"
+        }
     }
 
 

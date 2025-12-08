@@ -86,6 +86,13 @@ def train_deepspeed(config: Optional[dict] = None, ds_config: Optional[dict] = N
     )
 
     if dist.get_rank() == 0:
+        if wandb.run is None and config.get("wandb", {}).get("enabled", False):
+             wandb.init(
+                project=config["wandb"].get("project", "Translate-Vi-En"),
+                name=config["wandb"].get("name", "deepspeed_run"),
+                config=config
+            )
+
         total_params = sum(p.numel() for p in model.parameters())
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         print(f"==================================================")

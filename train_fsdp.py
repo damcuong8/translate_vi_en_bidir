@@ -46,18 +46,18 @@ def train_fsdp(config: Optional[dict] = None):
         train_dataset,
         batch_size=config['train_batch_size'],
         sampler=train_sampler,
-        num_workers=0,
+        num_workers=2,
         collate_fn=collate_fn,
-        pin_memory=False
+        pin_memory=True
     )
     
     val_dataloader = DataLoader(
         val_dataset,
         batch_size=config['val_batch_size'],
         sampler=val_sampler,
-        num_workers=0,
+        num_workers=2,
         collate_fn=collate_fn,
-        pin_memory=False
+        pin_memory=True
     )
 
     model_config = ModelConfig(vocab_size=tokenizer.vocab_size)
@@ -92,6 +92,12 @@ def train_fsdp(config: Optional[dict] = None):
     save_total_limit = config.get('save_total_limit', 3)
     
     if rank == 0:
+        if config.get("wandb", {}).get("enabled", False):
+            wandb.init(
+                project=config["wandb"].get("project", "Translate-Vi-En"),
+                name=config["wandb"].get("name", "fsdp_run"),
+                config=config
+            )
         print(f"==================================================")
         print(f"FSDP Training Started. World Size: {world_size}")
         print(f"AMP Enabled: {use_amp}, Dtype: {amp_dtype}")
@@ -145,7 +151,7 @@ def train_fsdp(config: Optional[dict] = None):
             
             # Backward pass with GradScaler
             scaler.scale(scaled_loss).backward()
-            accumulated_loss += total_loss.item()
+            accumulated_loss += total_loss
             
             # Perform optimizer step after accumulation
             if (step + 1) % gradient_accumulation_steps == 0:
@@ -179,7 +185,7 @@ def train_fsdp(config: Optional[dict] = None):
                             "loss_lm": loss_lm.item(),
                             "enc_aux_loss": enc_aux_loss.item(),
                             "dec_aux_loss": dec_aux_loss.item(),
-                            "total_loss": avg_loss,
+                            "total_loss": avg_loss.item(),
                             "grad_norm": grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm,
                             "lr": scheduler.get_last_lr()[0],
                             "global_step": global_step,
@@ -194,7 +200,7 @@ def train_fsdp(config: Optional[dict] = None):
                         optimizer=optimizer,
                         scheduler=scheduler,
                         scaler=scaler,
-                        epoch=epoch,
+                        epoch=epoch,    
                         global_step=global_step,
                         config=config,
                         rank=rank,
