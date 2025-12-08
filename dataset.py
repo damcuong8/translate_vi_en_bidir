@@ -11,7 +11,8 @@ class BidirectionalDataset(Dataset):
         # Filter sequences longer than max_seq_len
         self.ds = self.ds.filter(
             lambda x: (len(x["input_ids_en"]) <= max_seq_len) and (len(x["input_ids_vi"]) <= max_seq_len),
-            num_proc=min(os.cpu_count(), 4)
+            num_proc=min(os.cpu_count(), 4),
+            load_from_cache_file=False
         )
         
         self.tokenizer = tokenizer
