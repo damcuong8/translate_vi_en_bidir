@@ -4,6 +4,7 @@ import os
 import torch
 import torch.optim as optim
 import torch.distributed as dist
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.utils.data import DataLoader
 from torch.cuda.amp import GradScaler, autocast
 import wandb
@@ -68,12 +69,33 @@ def train_fsdp(config: Optional[dict] = None):
 
     if rank == 0:
         print(f"Model wrapped with FSDP: \n{model}")
-        print(f"Shared embedding weight pointer: {id(model.shared.weight)}")
+        
+        def check_fsdp_unit(name, module):
+            is_fsdp = isinstance(module, FSDP)
+            unit_id = id(module)
+            weight_id = id(module.weight) if hasattr(module, "weight") else None
+            print(f"[{name}] Is FSDP: {is_fsdp}, Unit ID: {unit_id}, Weight ID: {weight_id}")
+            return unit_id
+
+        print("--- Checking FSDP Wrapping & Shared Embeddings ---")
+        shared_unit = check_fsdp_unit("Shared Embedding", model.shared)
+        
         if hasattr(model.encoder, "embedding"):
-             print(f"Encoder embedding weight pointer: {id(model.encoder.embedding.weight)}")
+             enc_unit = check_fsdp_unit("Encoder Embedding", model.encoder.embedding)
+             if shared_unit != enc_unit:
+                 print(f"Warning: Shared and Encoder Embedding are different units/objects!")
+             else:
+                 print("Shared and Encoder Embedding are the SAME unit/object.")
+
         if hasattr(model.decoder, "embedding"):
-             print(f"Decoder embedding weight pointer: {id(model.decoder.embedding.weight)}")
+             dec_unit = check_fsdp_unit("Decoder Embedding", model.decoder.embedding)
+             if shared_unit != dec_unit:
+                 print(f"Warning: Shared and Decoder Embedding are different units/objects!")
+             else:
+                 print("Shared and Decoder Embedding are the SAME unit/object.")
+
         print(f"LM Head weight pointer: {id(model.lm_head.weight)}")
+        print("------------------------------------------------")
 
 
     if config['use_torch_compile']:
