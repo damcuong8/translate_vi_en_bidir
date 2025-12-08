@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from dataclasses import dataclass
 from typing import Optional
 from torch.nn.attention import sdpa_kernel, SDPBackend
-from deepspeed.moe.layer import MoE
+
 
 @dataclass
 class ModelConfig:
@@ -444,6 +444,9 @@ class FSDPMoEBlock(nn.Module):
 
         return output, aux_loss
 
+
+if ModelConfig.use_deepspeed_moe:
+    from deepspeed.moe.layer import MoE
 
 class DeepSpeedMoEBlock(nn.Module):
     def __init__(
