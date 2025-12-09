@@ -508,7 +508,7 @@ def save_checkpoint(
             ignore_frozen_params=False,
             keep_submodule_prefixes=True,
             strict=True,
-            broadcast_from_rank0=True,
+            broadcast_from_rank0=False,
             flatten_optimizer_state_dict=False,
         )
         dcp_state_cache = get_state_dict(model, [optimizer] if (optimizer is not None and save_optimizer_state) else [], options=gather_options)
@@ -754,6 +754,9 @@ def load_checkpoint(
         raise FileNotFoundError(f"Checkpoint not found: {original_path}")
     
     logger.info(f"Loading checkpoint from {checkpoint_file}")
+    
+    # Map to CPU for safety on load (model load_state_dict handles device placement)
+    # UNLESS user provides custom map_location, but typically 'cpu' is safest default
     checkpoint = torch.load(checkpoint_file, map_location="cpu")
     
     # Handle DCP-like dictionary if saved via simple save using AppState structure
