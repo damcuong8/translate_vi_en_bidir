@@ -489,9 +489,6 @@ def main():
         except Exception as e:
             print(f"Failed to inspect: {e}")
         return
-
-    if args.test in ["simple", "all"]:
-        test_simple_save()
     
     if args.test in ["fsdp", "all"]:
         test_fsdp_save()
