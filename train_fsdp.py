@@ -203,8 +203,36 @@ def train_fsdp(config: Optional[dict] = None):
                     with torch.no_grad():
                         src_text_log = batch['src_text'][0]
                         tgt_text_log = batch['tgt_text'][0]
-                        pred_ids = torch.argmax(logits[0], dim=-1)
-                        pred_text_log = tokenizer.decode(pred_ids, skip_special_tokens=False)
+                        
+                        # Simple Greedy Decoding for logging
+                        curr_src_ids = batch['src_input_ids'][0].unsqueeze(0)
+                        curr_src_mask = batch['src_attention_mask'][0].unsqueeze(0)
+                        
+                        # Start with BOS
+                        curr_tgt_ids = torch.tensor([[tokenizer.bos_token_id]], device=local_rank)
+                        generated_ids = []
+                        
+                        for _ in range(100): # Max gen length
+                            curr_tgt_mask = torch.ones(curr_tgt_ids.shape, device=local_rank)
+                            dummy_labels = torch.zeros_like(curr_tgt_ids)
+                            
+                            gen_logits, _, _, _ = model(
+                                curr_src_ids, 
+                                curr_src_mask, 
+                                curr_tgt_ids, 
+                                curr_tgt_mask, 
+                                dummy_labels
+                            )
+                            
+                            next_token_id = torch.argmax(gen_logits[0, -1, :]).item()
+                            
+                            if next_token_id == tokenizer.eos_token_id:
+                                break
+                            
+                            generated_ids.append(next_token_id)
+                            curr_tgt_ids = torch.cat([curr_tgt_ids, torch.tensor([[next_token_id]], device=local_rank)], dim=1)
+                            
+                        pred_text_log = tokenizer.decode(generated_ids, skip_special_tokens=False)
                         
                         print(f"\nStep {step} | Src: {src_text_log}")
                         print(f"Ref: {tgt_text_log}")
