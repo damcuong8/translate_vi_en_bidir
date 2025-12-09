@@ -306,21 +306,21 @@ def train_fsdp(config: Optional[dict] = None):
                         })
                 
                 # Save checkpoint at regular intervals
-                # if global_step > 0 and global_step % save_steps == 0:
-                #     save_checkpoint(
-                #         model=model,
-                #         optimizer=optimizer,
-                #         scheduler=scheduler,
-                #         scaler=scaler,
-                #         epoch=epoch,
-                #         step=global_step,
-                #         global_step=global_step,
-                #         config=config,
-                #         rank=rank
-                #     )
-                #     # Sync all ranks after checkpoint
-                #     if dist.is_available() and dist.is_initialized():
-                #         dist.barrier()
+                if global_step > 0 and global_step % save_steps == 0:
+                    save_checkpoint(
+                        model=model,
+                        optimizer=optimizer,
+                        scheduler=scheduler,
+                        scaler=scaler,
+                        epoch=epoch,
+                        step=global_step,
+                        global_step=global_step,
+                        config=config,
+                        rank=rank
+                    )
+                    # Sync all ranks after checkpoint
+                    if dist.is_available() and dist.is_initialized():
+                        dist.barrier()
                 
                 # Evaluate at regular intervals
                 if global_step > 0 and global_step % eval_steps == 0:
