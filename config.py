@@ -117,9 +117,9 @@ def get_kaggle_config():
         "amp_dtype": "fp16",  # "fp16" or "bf16"
         
         # Checkpoint Config
-        "save_steps": 500,  # Save checkpoint every N steps
+        "save_steps": 10000,  # Save checkpoint every N steps
         "eval_steps": 1000, # Evaluate every N steps
-        "save_total_limit": 10,  # Keep only last N checkpoints
+        "save_total_limit": 5,  # Keep only last N checkpoints
         "save_optimizer_state": True,  # Include optimizer/scheduler in checkpoint
         
         # FSDP Config

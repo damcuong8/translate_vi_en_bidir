@@ -706,6 +706,7 @@ class Transformer(nn.Module):
         decoder_output, decoder_aux_loss = self.decoder(tgt_input_ids, encoder_output, tgt_mask=tgt_mask, src_mask=src_mask)
         logits = self.lm_head(self.norm(decoder_output))
         loss_lm = F.cross_entropy(logits.view(-1, self.config.vocab_size), labels.view(-1))
+        
         return logits, loss_lm, encoder_aux_loss, decoder_aux_loss
 
 def build_transformer(

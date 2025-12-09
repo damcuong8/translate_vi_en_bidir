@@ -1,390 +1,469 @@
 import argparse
 import torch
-import sentencepiece as spm
 from tqdm import tqdm
 import time
 import os
+import json
 from pathlib import Path
+from typing import List, Optional
 
-from model import build_transformer
-from config import get_config, latest_weights_file_path
-from translate import translate, beam_search
-from dataset import causal_mask
+# Imports from codebase
+from model import build_transformer, ModelConfig
+from config import get_kaggle_config
+from checkpoint_utils import load_checkpoint, _has_dcp_artifacts, _resolve_checkpoint_dir
+from transformers import AutoTokenizer
 
 # Import metrics
 from torchmetrics.text import CharErrorRate, WordErrorRate, BLEUScore
 
-def load_tokenizers(config):
-    """Load the source and target tokenizers"""
-    tokenizer_src = spm.SentencePieceProcessor()
-    tokenizer_tgt = spm.SentencePieceProcessor()
-    tokenizer_src.load(config['tokenizer_src_path'])
-    tokenizer_tgt.load(config['tokenizer_tgt_path'])
-    return tokenizer_src, tokenizer_tgt
-
-def load_model(config, model_path=None, device='cuda'):
-    """Load the transformer model"""
-    # Determine which model weights to use
-    if model_path is None:
-        model_path = latest_weights_file_path(config)
-        if model_path is None:
-            raise ValueError("No model weights found. Please train the model first.")
-    elif not os.path.exists(model_path):
-        # Check if it might be a relative path in the weights directory
-        weights_dir = f"{config['datasource']}_{config['model_folder']}"
-        potential_path = os.path.join(weights_dir, model_path)
-        if os.path.exists(potential_path):
-            model_path = potential_path
-        else:
-            raise ValueError(f"Model weights not found at: {model_path}")
+def dcp_to_torch_save(dcp_path, output_path):
+    """
+    Convert a Distributed Checkpoint (DCP) to a standard PyTorch binary file.
+    """
+    print(f"Converting DCP {dcp_path} to {output_path}...")
+    device = 'cpu' # Use CPU for conversion
     
-    # Load tokenizers to get vocabulary sizes
-    tokenizer_src, tokenizer_tgt = load_tokenizers(config)
+    # Load default config
+    config_dict = get_kaggle_config()
+    
+    # Tokenizer for vocab size
+    tokenizer_path = config_dict.get('tokenizer_path')
+    if not tokenizer_path or not os.path.exists(tokenizer_path):
+            if os.path.exists("tokenizer"):
+                tokenizer_path = "tokenizer"
+    
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+    except Exception as e:
+        print(f"Warning: Could not load tokenizer for conversion: {e}")
+        # Fallback to default vocab size if tokenizer fails? 
+        # But ModelConfig default is 24000.
+        # Let's hope it works or user provided valid path in config/default.
+        raise
+        
+    model_config = ModelConfig(vocab_size=tokenizer.vocab_size)
     
     # Build model
-    print(f"Building model...")
-    model = build_transformer(
-        tokenizer_src.vocab_size(),
-        tokenizer_tgt.vocab_size(),
-        config.get('max_len', 500),
-        config.get('max_len', 500),
-        d_model=config.get('d_model', 384),
-        N=config.get('num_layers', 4),
-        h=config.get('num_heads', 8),
-        dropout=config.get('dropout', 0.15),
-        d_ff=config.get('d_ff', 1536)
+    model = build_transformer(config=model_config)
+    model = model.to(device)
+    
+    # Load DCP
+    load_checkpoint(
+        checkpoint_path=dcp_path,
+        model=model,
+        optimizer=None,
+        scheduler=None,
+        config=config_dict,
+        strict=False
     )
     
-    # Load model weights
-    print(f"Loading model weights from: {model_path}")
-    state = torch.load(model_path, map_location=device)
-    model.load_state_dict(state['model_state_dict'])
-    model = model.to(device)
-    model.eval()
-    
-    return model, tokenizer_src, tokenizer_tgt
+    # Save
+    torch.save(model.state_dict(), output_path)
+    print("Conversion complete.")
 
-def batch_translate(model, sentences, tokenizer_src, tokenizer_tgt, device, 
-                   batch_size=8, beam_size=1, max_len=None):
+def _ensure_torch_checkpoint(path: str) -> str:
+    """Convert DCP shards to pytorch_model.bin if needed."""
+    if os.path.isfile(path):
+        return path
+
+    if os.path.isdir(path):
+        candidate = os.path.join(path, "pytorch_model.bin")
+        if os.path.isfile(candidate):
+            return candidate
+
+        metadata_file = os.path.join(path, ".metadata")
+        has_dcp = os.path.isfile(metadata_file) or any(
+            entry.startswith("__") and entry.endswith(".distcp")
+            for entry in os.listdir(path)
+            if os.path.isdir(os.path.join(path, entry))
+        )
+
+        if has_dcp:
+            print("  Detected DCP checkpoint; converting to pytorch_model.bin ...")
+            try:
+                dcp_to_torch_save(path, candidate)
+                print(f"  ✓ Materialized Torch checkpoint at {candidate}")
+                return candidate
+            except Exception as exc:
+                print(f"  ❌ Failed to convert DCP checkpoint: {exc}")
+
+    return path
+
+def load_model_and_tokenizer(config_path=None, model_path=None, device='cuda', save_converted_path=None):
     """
-    Translate a batch of sentences for faster processing
+    Load model and tokenizer.
+    Handles DCP checkpoints by converting/loading them via checkpoint_utils.
+    Optionally saves the converted checkpoint to a single file.
+    """
+    # Load config
+    if config_path and os.path.exists(config_path):
+        with open(config_path, 'r') as f:
+            config_dict = json.load(f)
+    else:
+        print("Warning: No config file provided or found. Using default Kaggle config.")
+        config_dict = get_kaggle_config()
     
-    Args:
-        model: The trained transformer model
-        sentences: List of sentences to translate
-        tokenizer_src: Source language tokenizer
-        tokenizer_tgt: Target language tokenizer
-        device: Device to run inference on
-        batch_size: Batch size for processing
-        beam_size: Beam size for beam search (1 = greedy)
-        max_len: Maximum sequence length
+    # Initialize tokenizer
+    tokenizer_path = config_dict.get('tokenizer_path')
+    if not tokenizer_path or not os.path.exists(tokenizer_path):
+        # Fallback to local tokenizer.py if path invalid
+        print(f"Tokenizer path {tokenizer_path} not found. Attempting to use local tokenizer...")
+        # Note: This requires the tokenizer to be importable or available
+        # For now, we assume the user provides a valid path or we fail gracefully
+        # Try to find a tokenizer directory in current dir
+        if os.path.exists("tokenizer"):
+             tokenizer_path = "tokenizer"
+        else:
+             print("Warning: Could not find tokenizer. Please specify valid tokenizer_path in config.")
+
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+    except Exception as e:
+        print(f"Error loading tokenizer from {tokenizer_path}: {e}")
+        raise
+
+    # Build model config
+    model_config = ModelConfig(vocab_size=tokenizer.vocab_size)
+    for key, value in config_dict.items():
+        if hasattr(model_config, key):
+            setattr(model_config, key, value)
+            
+    # Build model
+    print("Building model...")
+    model = build_transformer(config=model_config)
+    model = model.to(device)
+    
+    # Load weights
+    if model_path:
+        print(f"Loading checkpoint from: {model_path}")
         
-    Returns:
-        List of translated sentences
+        # Check if DCP
+        is_dcp = False
+        try:
+            resolved_path = _resolve_checkpoint_dir(model_path)
+            if _has_dcp_artifacts(resolved_path):
+                is_dcp = True
+                print("Detected Distributed Checkpoint (DCP).")
+        except:
+            pass
+            
+        # load_checkpoint handles both and loads into model
+        load_checkpoint(
+            checkpoint_path=model_path,
+            model=model,
+            optimizer=None,
+            scheduler=None,
+            config=config_dict,
+            strict=False # Allow missing keys
+        )
+        
+        # Save converted if requested
+        if save_converted_path:
+            print(f"Saving converted model to {save_converted_path}...")
+            torch.save(model.state_dict(), save_converted_path)
+            print("Saved.")
+        elif is_dcp:
+            print("Note: Model loaded from DCP. To save as standard torch checkpoint, provide --save_converted_path")
+            
+    else:
+        print("Warning: No model path provided. Model initialized with random weights.")
+
+    model.eval()
+    return model, tokenizer, config_dict
+
+def encode_input(tokenizer, text, src_lang_token, device):
     """
-    # Set default max_len
-    if max_len is None:
-        max_len = 500
+    Encode input text with source language token.
+    Format: [src_lang_token] + text + [eos]
+    """
+    # Get token IDs
+    src_lang_id = tokenizer.convert_tokens_to_ids(src_lang_token)
     
-    # Special token IDs
-    sos_idx = tokenizer_src.piece_to_id("<s>")
-    eos_idx = tokenizer_src.piece_to_id("</s>")
-    pad_idx = tokenizer_src.piece_to_id("<pad>")
+    # Tokenize
+    tokens = tokenizer.encode(text, add_special_tokens=False)
     
+    # Construct sequence: [src_lang_token] + tokens + [eos]
+    input_ids = [src_lang_id] + tokens + [tokenizer.eos_token_id]
+    
+    return torch.tensor(input_ids, dtype=torch.long, device=device).unsqueeze(0) # Batch size 1
+
+def greedy_decode(model, encoder_input, encoder_mask, tokenizer, tgt_lang_token, max_len, device):
+    """
+    Greedy decoding for a single sequence.
+    """
+    # Encoder
+    encoder_output, _ = model.encoder(encoder_input, mask=encoder_mask)
+    
+    # Decoder Input: [bos, tgt_lang_token]
+    tgt_lang_id = tokenizer.convert_tokens_to_ids(tgt_lang_token)
+    decoder_input = torch.tensor([[tokenizer.bos_token_id, tgt_lang_id]], dtype=torch.long, device=device)
+    
+    for _ in range(max_len):
+        # Create decoder mask (padding mask - all ones since no padding in greedy single batch)
+        # But we need to match shape expected by model: (B, 1, 1, S) or (B, S) to be converted
+        # The model's forward converts (B, S) -> (B, 1, 1, S)
+        # Here we have no padding, so mask is all ones
+        tgt_mask = torch.ones((1, decoder_input.size(1)), dtype=torch.long, device=device)
+        
+        # Decoder forward
+        # Note: model.decoder returns decoder_output. We project it using lm_head
+        decoder_output, _ = model.decoder(decoder_input, encoder_output, tgt_mask=None, src_mask=encoder_mask) # tgt_mask handled?
+        
+        # Wait, model.decoder expects tgt_mask for attention.
+        # If passed None, it might fail or assume full attention.
+        # model.py: tgt_mask = (tgt_attention_mask == 0)...
+        # In DecoderBlock: mask=tgt_mask.
+        # If we pass tgt_mask=None to decoder, it goes to AttentionBlock.
+        # AttentionBlock: mask=None.
+        # If causal_mask=True (which it is for decoder), it adds causal mask.
+        # So None is fine for greedy decode (no padding).
+        
+        prob = model.lm_head(model.norm(decoder_output[:, -1]))
+        _, next_token = torch.max(prob, dim=1)
+        next_token = next_token.item()
+        
+        decoder_input = torch.cat([decoder_input, torch.tensor([[next_token]], device=device)], dim=1)
+        
+        if next_token == tokenizer.eos_token_id:
+            break
+            
+    # Exclude BOS and Lang Token from output
+    return decoder_input.squeeze().tolist()[2:] 
+
+def batch_translate(model, sentences, tokenizer, src_lang, tgt_lang, device, batch_size=32, max_len=500, config=None):
+    """
+    Translate a list of sentences.
+    """
+    model.eval()
     translations = []
     
-    # Process in batches
-    for i in range(0, len(sentences), batch_size):
-        batch_sentences = sentences[i:i+batch_size]
-        batch_size_actual = len(batch_sentences)
-        
-        # Encode all sentences in the batch
-        with torch.no_grad():
-            # Create a list of tokenized sentences
-            batch_tokens = [tokenizer_src.encode(sent) for sent in batch_sentences]
-            
-            # Find max length in this batch
-            max_len_batch = max(len(tokens) for tokens in batch_tokens) + 2  # +2 for SOS and EOS
-            
-            # Create input tensor with padding
-            encoder_inputs = torch.full((batch_size_actual, max_len_batch), 
-                                        pad_idx, dtype=torch.long, device=device)
-            
-            # Fill in the actual tokens
-            for j, tokens in enumerate(batch_tokens):
-                # Add SOS and EOS tokens
-                encoder_inputs[j, 0] = sos_idx
-                encoder_inputs[j, 1:len(tokens)+1] = torch.tensor(tokens, dtype=torch.long, device=device)
-                encoder_inputs[j, len(tokens)+1] = eos_idx
-            
-            # Create encoder masks (1 for tokens, 0 for padding)
-            encoder_masks = (encoder_inputs != pad_idx).unsqueeze(1).unsqueeze(1).int()
-            
-            # Encode all sentences in batch
-            encoder_outputs = model.encode(encoder_inputs, encoder_masks)
-            
-            # Translate each sentence in the batch
-            batch_translations = []
-            for j in range(batch_size_actual):
-                # Extract this sentence's encoder output and mask
-                encoder_output = encoder_outputs[j:j+1]  # Keep batch dimension
-                encoder_mask = encoder_masks[j:j+1]      # Keep batch dimension
-                
-                if beam_size == 1:
-                    # Greedy search
-                    # Initialize decoder input
-                    decoder_input = torch.tensor([[sos_idx]], dtype=torch.long, device=device)
-                    
-                    generated_tokens = []
-                    
-                    # Generate tokens one by one
-                    for _ in range(max_len):
-                        # Create decoder mask
-                        decoder_mask = causal_mask(decoder_input.size(1)).to(device)
-                        
-                        # Decode
-                        out = model.decode(encoder_output, encoder_mask, decoder_input, decoder_mask)
-                        
-                        # Project and get next token
-                        prob = model.project(out[:, -1])
-                        _, next_token = torch.max(prob, dim=1)
-                        next_token = next_token.item()
-                        
-                        # Add token to generated tokens
-                        generated_tokens.append(next_token)
-                        
-                        # Break if end token
-                        if next_token == eos_idx:
-                            break
-                        
-                        # Update decoder input
-                        decoder_input = torch.cat([
-                            decoder_input, 
-                            torch.tensor([[next_token]], dtype=torch.long, device=device)
-                        ], dim=1)
-                    
-                    # Convert tokens to text
-                    translation = tokenizer_tgt.decode(generated_tokens)
-                else:
-                    # Use beam search for better quality
-                    # Initialize beam
-                    beam = [(torch.tensor([[sos_idx]], device=device), 0.0, False)]
-                    finished_sequences = []
-                    
-                    # Generate tokens step by step
-                    for step in range(max_len):
-                        candidates = []
-                        
-                        for seq, score, finished in beam:
-                            if finished:
-                                candidates.append((seq, score, finished))
-                                continue
-                            
-                            decoder_mask = causal_mask(seq.size(1)).to(device)
-                            out = model.decode(encoder_output, encoder_mask, seq, decoder_mask)
-                            logits = model.project(out[:, -1])
-                            
-                            probs = torch.nn.functional.log_softmax(logits, dim=-1)
-                            topk_probs, topk_indices = torch.topk(probs, beam_size, dim=-1)
-                            
-                            for k in range(beam_size):
-                                token_idx = topk_indices[0, k].item()
-                                token_prob = topk_probs[0, k].item()
-                                
-                                new_seq = torch.cat([seq, torch.tensor([[token_idx]], device=device)], dim=1)
-                                new_score = score + token_prob
-                                is_finished = (token_idx == eos_idx)
-                                
-                                if is_finished:
-                                    length_penalty = ((5 + new_seq.size(1)) ** 0.6) / (5 + 1) ** 0.6
-                                    normalized_score = new_score / length_penalty
-                                    finished_sequences.append((new_seq, normalized_score, True))
-                                else:
-                                    candidates.append((new_seq, new_score, False))
-                        
-                        if len(candidates) == 0:
-                            break
-                        
-                        all_candidates = candidates + finished_sequences
-                        all_candidates.sort(key=lambda x: x[1], reverse=True)
-                        beam = all_candidates[:beam_size]
-                        
-                        finished_sequences = [item for item in beam if item[2]]
-                        
-                        if all(finished for _, _, finished in beam):
-                            break
-                    
-                    # Select the best sequence
-                    if finished_sequences:
-                        best_seq, _, _ = max(finished_sequences, key=lambda x: x[1])
-                    else:
-                        best_seq, _, _ = max(beam, key=lambda x: x[1])
-                    
-                    # Convert to token list without SOS and EOS
-                    tokens = best_seq.squeeze().tolist()[1:]
-                    
-                    # Remove EOS token if present
-                    if tokens and tokens[-1] == eos_idx:
-                        tokens = tokens[:-1]
-                    
-                    # Convert tokens to text
-                    translation = tokenizer_tgt.decode(tokens)
-                
-                batch_translations.append(translation)
-            
-            translations.extend(batch_translations)
+    # Get language tokens
+    lang_token_map = config.get('lang_token_map', {}) if config else {}
+    if not lang_token_map:
+        lang_token_map = {
+            "eng": "__eng__",
+            "vie": "__vie__",
+        }
     
+    src_token = lang_token_map.get(src_lang, lang_token_map.get(src_lang[:2], f"__{src_lang}__"))
+    tgt_token = lang_token_map.get(tgt_lang, lang_token_map.get(tgt_lang[:2], f"__{tgt_lang}__"))
+    
+    print(f"Translating {len(sentences)} sentences from {src_lang} ({src_token}) to {tgt_lang} ({tgt_token})...")
+
+    with torch.no_grad():
+        for i in tqdm(range(0, len(sentences), batch_size)):
+            batch_sentences = sentences[i:i+batch_size]
+            
+            # Prepare batch inputs
+            # [src_token] + content + [eos]
+            src_token_id = tokenizer.convert_tokens_to_ids(src_token)
+            
+            batch_input_ids = []
+            for sent in batch_sentences:
+                tokens = tokenizer.encode(sent, add_special_tokens=False)
+                # Truncate if too long (optional)
+                if len(tokens) > max_len - 2:
+                    tokens = tokens[:max_len-2]
+                batch_input_ids.append([src_token_id] + tokens + [tokenizer.eos_token_id])
+                
+            # Pad
+            max_batch_len = max(len(ids) for ids in batch_input_ids)
+            padded_input_ids = []
+            attention_masks = []
+            
+            for ids in batch_input_ids:
+                pad_len = max_batch_len - len(ids)
+                padded_ids = ids + [tokenizer.pad_token_id] * pad_len
+                mask = [1] * len(ids) + [0] * pad_len
+                padded_input_ids.append(padded_ids)
+                attention_masks.append(mask)
+                
+            src_inputs = torch.tensor(padded_input_ids, dtype=torch.long, device=device)
+            src_masks = torch.tensor(attention_masks, dtype=torch.long, device=device)
+            
+            # Create proper mask for model: (B, 1, 1, S)
+            # The model expects (B, S) where 0 is pad, and converts it internally.
+            # But wait, model.py Transformer.forward does:
+            # src_mask = (src_attention_mask == 0).unsqueeze(1).unsqueeze(2)
+            # So we pass (B, S) src_masks (1 for valid, 0 for pad).
+            
+            # Encoder
+            # Encoder.forward takes (x, mask)
+            # mask should be (B, 1, 1, S) or compatible. 
+            # Transformer.forward handles the conversion. Here we call encoder directly.
+            # We must convert mask manually.
+            enc_mask_expanded = (src_masks == 0).unsqueeze(1).unsqueeze(2)
+            encoder_output, _ = model.encoder(src_inputs, mask=enc_mask_expanded)
+            
+            # Greedy Decode for batch
+            # Initial decoder input: [bos, tgt_token]
+            tgt_token_id = tokenizer.convert_tokens_to_ids(tgt_token)
+            decoder_input = torch.tensor([[tokenizer.bos_token_id, tgt_token_id]] * len(batch_sentences), dtype=torch.long, device=device)
+            
+            finished = torch.zeros(len(batch_sentences), dtype=torch.bool, device=device)
+            
+            for _ in range(max_len):
+                # Decoder mask not needed for attention within decoder (causal handled), 
+                # but we need to mask padding if we were padding decoder input (we aren't, all same length grow together)
+                # However, for Cross-Attention, we need src_mask (enc_mask_expanded).
+                
+                # Decoder
+                decoder_output, _ = model.decoder(decoder_input, encoder_output, tgt_mask=None, src_mask=enc_mask_expanded)
+                
+                # Project last token
+                logits = model.lm_head(model.norm(decoder_output[:, -1]))
+                next_tokens = torch.argmax(logits, dim=-1)
+                
+                # Update finished status
+                finished |= (next_tokens == tokenizer.eos_token_id)
+                
+                # Append
+                decoder_input = torch.cat([decoder_input, next_tokens.unsqueeze(1)], dim=1)
+                
+                if finished.all():
+                    break
+            
+            # Decode to text
+            for j, seq in enumerate(decoder_input):
+                # Skip [bos, tgt_token] (first 2)
+                # Stop at first eos
+                tokens = seq[2:].tolist()
+                try:
+                    eos_index = tokens.index(tokenizer.eos_token_id)
+                    tokens = tokens[:eos_index]
+                except ValueError:
+                    pass
+                
+                text = tokenizer.decode(tokens)
+                translations.append(text)
+                
     return translations
 
-def evaluate(test_file, reference_file, model_path=None, beam_size=1, batch_size=32, use_gpu=True):
-    """
-    Evaluate the translation model on a test set
-    
-    Args:
-        test_file: Path to file with source sentences
-        reference_file: Path to file with reference translations
-        model_path: Path to model weights
-        beam_size: Beam size for beam search
-        batch_size: Batch size for processing
-        use_gpu: Whether to use GPU for inference
-        
-    Returns:
-        Dict of metrics: BLEU, WER, CER
-    """
-    # Load configuration
-    config = get_config()
-    
-    # Set device
-    if use_gpu and torch.cuda.is_available():
-        device = torch.device("cuda")
-        print("Using GPU for evaluation")
-    else:
-        device = torch.device("cpu")
-        print("Using CPU for evaluation")
-    
-    # Load model
-    model, tokenizer_src, tokenizer_tgt = load_model(config, model_path, device)
-    
-    # Read test and reference files
-    with open(test_file, 'r', encoding='utf-8') as f:
-        test_sentences = f.read().splitlines()
-    
-    with open(reference_file, 'r', encoding='utf-8') as f:
-        reference_sentences = f.read().splitlines()
-    
-    if len(test_sentences) != len(reference_sentences):
-        raise ValueError("Test and reference files must have the same number of lines")
-    
-    print(f"Evaluating on {len(test_sentences)} sentences...")
-    
-    # Translate test sentences
-    start_time = time.time()
-    translated_sentences = batch_translate(
-        model, test_sentences, tokenizer_src, tokenizer_tgt, device,
-        batch_size=batch_size, beam_size=beam_size, max_len=config.get('max_len', 500)
-    )
-    end_time = time.time()
-    
-    # Compute metrics
+def calculate_metrics(predictions, references):
     metrics = {}
     
-    # Compute BLEU score
+    # BLEU
     try:
-        bleu_metric = BLEUScore()
-        
-        # Tokenize predictions and references
-        tokenized_predictions = [sent.split() for sent in translated_sentences]
-        tokenized_references = [[sent.split()] for sent in reference_sentences]  # List of lists for multiple references
-        
-        bleu = bleu_metric(tokenized_predictions, tokenized_references)
-        metrics['bleu'] = bleu.item()
+        bleu = BLEUScore()
+        # BLEU expects tokenized
+        metrics['bleu'] = bleu(predictions, [[r] for r in references]).item()
     except Exception as e:
-        print(f"Error calculating BLEU: {str(e)}")
+        print(f"BLEU Error: {e}")
         metrics['bleu'] = 0.0
-    
-    # Compute WER
-    try:
-        wer_metric = WordErrorRate()
-        wer = wer_metric(translated_sentences, reference_sentences)
-        metrics['wer'] = wer.item()
-    except Exception as e:
-        print(f"Error calculating WER: {str(e)}")
-        metrics['wer'] = 1.0  # Worst case
-    
-    # Compute CER
-    try:
-        cer_metric = CharErrorRate()
-        cer = cer_metric(translated_sentences, reference_sentences)
-        metrics['cer'] = cer.item()
-    except Exception as e:
-        print(f"Error calculating CER: {str(e)}")
-        metrics['cer'] = 1.0  # Worst case
-    
-    # Print results
-    print("\nEvaluation results:")
-    print(f"BLEU score: {metrics['bleu']:.4f}")
-    print(f"Word Error Rate: {metrics['wer']:.4f}")
-    print(f"Character Error Rate: {metrics['cer']:.4f}")
-    print(f"Evaluation time: {end_time - start_time:.2f} seconds")
-    print(f"Average time per sentence: {(end_time - start_time) / len(test_sentences):.4f} seconds")
-    
-    # Save evaluation results including examples
-    output_dir = Path('evaluation_results')
-    output_dir.mkdir(exist_ok=True)
-    
-    timestamp = time.strftime("%Y%m%d-%H%M%S")
-    output_file = output_dir / f"eval_results_{timestamp}.txt"
-    
-    with open(output_file, 'w', encoding='utf-8') as f:
-        f.write(f"Evaluation results:\n")
-        f.write(f"Model: {model_path}\n")
-        f.write(f"Beam size: {beam_size}\n")
-        f.write(f"Test file: {test_file}\n")
-        f.write(f"Reference file: {reference_file}\n\n")
         
-        f.write(f"BLEU score: {metrics['bleu']:.4f}\n")
-        f.write(f"Word Error Rate: {metrics['wer']:.4f}\n")
-        f.write(f"Character Error Rate: {metrics['cer']:.4f}\n")
-        f.write(f"Evaluation time: {end_time - start_time:.2f} seconds\n")
-        f.write(f"Average time per sentence: {(end_time - start_time) / len(test_sentences):.4f} seconds\n\n")
+    # WER
+    try:
+        wer = WordErrorRate()
+        metrics['wer'] = wer(predictions, references).item()
+    except Exception as e:
+        print(f"WER Error: {e}")
+        metrics['wer'] = 1.0
         
-        f.write("Examples (first 10):\n")
-        for i in range(min(10, len(test_sentences))):
-            f.write(f"\nExample {i+1}:\n")
-            f.write(f"Source: {test_sentences[i]}\n")
-            f.write(f"Reference: {reference_sentences[i]}\n")
-            f.write(f"Prediction: {translated_sentences[i]}\n")
-    
-    print(f"Evaluation results saved to {output_file}")
-    
+    # CER
+    try:
+        cer = CharErrorRate()
+        metrics['cer'] = cer(predictions, references).item()
+    except Exception as e:
+        print(f"CER Error: {e}")
+        metrics['cer'] = 1.0
+        
     return metrics
 
-def main():
-    parser = argparse.ArgumentParser(description="Evaluate translation model")
+def evaluate_direction(model, tokenizer, config, src_file, ref_file, src_lang, tgt_lang, device):
+    print(f"\nEvaluating Direction: {src_lang} -> {tgt_lang}")
+    print(f"Source: {src_file}")
+    print(f"Reference: {ref_file}")
     
-    parser.add_argument('--test_file', type=str, required=True, 
-                        help='Path to test file with source sentences')
-    parser.add_argument('--reference', type=str, required=True, 
-                        help='Path to reference file with target translations')
-    parser.add_argument('--model', type=str, default=None, 
-                        help='Path to model weights (default: latest)')
-    parser.add_argument('--beam', type=int, default=5, 
-                        help='Beam size for beam search (default: 5)')
-    parser.add_argument('--batch_size', type=int, default=32, 
-                        help='Batch size for processing (default: 32)')
-    parser.add_argument('--cpu', action='store_true', 
-                        help='Force CPU inference even if GPU is available')
+    if not os.path.exists(src_file) or not os.path.exists(ref_file):
+        print("Source or reference file not found. Skipping.")
+        return
+        
+    with open(src_file, 'r', encoding='utf-8') as f:
+        sources = f.read().splitlines()
+    with open(ref_file, 'r', encoding='utf-8') as f:
+        references = f.read().splitlines()
+        
+    if len(sources) != len(references):
+        print("Warning: Source and reference length mismatch. Truncating to shorter.")
+        min_len = min(len(sources), len(references))
+        sources = sources[:min_len]
+        references = references[:min_len]
+        
+    predictions = batch_translate(
+        model, sources, tokenizer, 
+        src_lang=src_lang, tgt_lang=tgt_lang, 
+        device=device,
+        batch_size=config.get('test_batch_size', 32),
+        config=config
+    )
+    
+    metrics = calculate_metrics(predictions, references)
+    
+    print(f"Results for {src_lang}->{tgt_lang}:")
+    print(f"BLEU: {metrics['bleu']:.4f}")
+    print(f"WER: {metrics['wer']:.4f}")
+    print(f"CER: {metrics['cer']:.4f}")
+    
+    # Save examples
+    output_dir = Path("evaluation_results")
+    output_dir.mkdir(exist_ok=True)
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    out_path = output_dir / f"eval_{src_lang}_{tgt_lang}_{timestamp}.txt"
+    
+    with open(out_path, 'w', encoding='utf-8') as f:
+        f.write(f"Metrics:\nBLEU: {metrics['bleu']}\nWER: {metrics['wer']}\nCER: {metrics['cer']}\n\n")
+        f.write("Examples:\n")
+        for i in range(min(10, len(predictions))):
+            f.write(f"Src: {sources[i]}\nRef: {references[i]}\nPred: {predictions[i]}\n\n")
+    print(f"Saved details to {out_path}")
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--config', type=str, help='Path to config json')
+    parser.add_argument('--checkpoint', type=str, required=True, help='Path to checkpoint (file or dir)')
+    parser.add_argument('--tokenizer_path', type=str, help='Path to tokenizer (overrides config)')
+    parser.add_argument('--save_converted_path', type=str, help='Path to save converted standard checkpoint')
+    
+    # Evaluation files
+    parser.add_argument('--test_en', type=str, help='Path to English/Source test file')
+    parser.add_argument('--test_vi', type=str, help='Path to Vietnamese/Target test file')
+    
+    # Optional direct specification
+    parser.add_argument('--src_file', type=str, help='Source file for single direction')
+    parser.add_argument('--ref_file', type=str, help='Reference file for single direction')
+    parser.add_argument('--src_lang', type=str, default='eng')
+    parser.add_argument('--tgt_lang', type=str, default='vie')
     
     args = parser.parse_args()
     
-    evaluate(
-        args.test_file,
-        args.reference,
-        args.model,
-        args.beam,
-        args.batch_size,
-        not args.cpu
-    )
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"Using device: {device}")
+    
+    if args.checkpoint is not None:
+        checkpoint_path = args.checkpoint
+        
+        print(f"Loading model from checkpoint: {checkpoint_path}")
+        
+        # Ensure it's a torch checkpoint (convert DCP if needed)
+        checkpoint_path = _ensure_torch_checkpoint(checkpoint_path)
+    
+    model, tokenizer, config = load_model_and_tokenizer(args.config, checkpoint_path, device, args.save_converted_path)
+    
+    if args.tokenizer_path:
+        # Re-load tokenizer if specified
+        print(f"Reloading tokenizer from {args.tokenizer_path}")
+        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path)
+
+    # Direction 1: En -> Vi (or Src -> Tgt)
+    if args.test_en and args.test_vi:
+        # Bidirectional evaluation
+        evaluate_direction(model, tokenizer, config, args.test_en, args.test_vi, 'en', 'vi', device)
+        evaluate_direction(model, tokenizer, config, args.test_vi, args.test_en, 'vi', 'en', device)
+    elif args.src_file and args.ref_file:
+        # Single direction
+        evaluate_direction(model, tokenizer, config, args.src_file, args.ref_file, args.src_lang, args.tgt_lang, device)
+    else:
+        print("Please provide --test_en and --test_vi for bidirectional evaluation, or --src_file and --ref_file for single direction.")
 
 if __name__ == "__main__":
-    main() 
+    main()

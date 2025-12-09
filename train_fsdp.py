@@ -198,6 +198,25 @@ def train_fsdp(config: Optional[dict] = None):
                 
                 # Update tqdm progress bar
                 val_pbar.set_postfix({'eval_loss': f'{total_loss.item():.4f}'})
+
+                if rank == 0 and step % 100 == 0:
+                    with torch.no_grad():
+                        src_text_log = batch['src_text'][0]
+                        tgt_text_log = batch['tgt_text'][0]
+                        pred_ids = torch.argmax(logits[0], dim=-1)
+                        pred_text_log = tokenizer.decode(pred_ids, skip_special_tokens=False)
+                        
+                        print(f"\nStep {step} | Src: {src_text_log}")
+                        print(f"Ref: {tgt_text_log}")
+                        print(f"Pred: {pred_text_log}\n")
+                        
+                        if wandb.run is not None:
+                            wandb.log({
+                                "validation_samples": wandb.Table(
+                                    columns=["Step", "Source", "Reference", "Prediction"],
+                                    data=[[step, src_text_log, tgt_text_log, pred_text_log]]
+                                )
+                            }, commit=False)
                 
                 # Log periodically during validation
                 if rank == 0 and step % 10 == 0:
@@ -291,19 +310,18 @@ def train_fsdp(config: Optional[dict] = None):
                     'grad_norm': f'{grad_norm:.2f}'
                 })
                 
-                if global_step % 10 == 0 and rank == 0:
-                    if wandb.run is not None:
-                        wandb.log({
-                            "loss_lm": loss_lm.item(),
-                            "enc_aux_loss": enc_aux_loss.item(),
-                            "dec_aux_loss": dec_aux_loss.item(),
-                            "total_loss": avg_loss.item(),
-                            "grad_norm": grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm,
-                            "lr": scheduler.get_last_lr()[0],
-                            "global_step": global_step,
-                            "epoch": epoch,
-                            "scaler_scale": scaler.get_scale()
-                        })
+                if wandb.run is not None:
+                    wandb.log({
+                        "loss_lm": loss_lm.item(),
+                        "enc_aux_loss": enc_aux_loss.item(),
+                        "dec_aux_loss": dec_aux_loss.item(),
+                        "total_loss": avg_loss.item(),
+                        "grad_norm": grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm,
+                        "lr": scheduler.get_last_lr()[0],
+                        "global_step": global_step,
+                        "epoch": epoch,
+                        "scaler_scale": scaler.get_scale()
+                    })
                 
                 # Save checkpoint at regular intervals
                 if global_step > 0 and global_step % save_steps == 0:
