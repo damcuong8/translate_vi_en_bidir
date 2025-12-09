@@ -16,7 +16,7 @@ from model import build_transformer, ModelConfig
 from dataset import BidirectionalDataset, Collator
 from transformers import AutoTokenizer
 from utils import wrap_model_with_fsdp, create_cosine_scheduler
-from checkpoint_utils import save_checkpoint_simple, save_checkpoint
+from checkpoint_utils import save_checkpoint
 from contextlib import nullcontext
 
 def train_fsdp(config: Optional[dict] = None):

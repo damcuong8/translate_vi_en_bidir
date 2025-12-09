@@ -50,24 +50,26 @@ class BidirectionalDataset(Dataset):
         # if idx is in the first half -> En -> Vi
         if idx < self.real_len:
             item = self.ds[idx]
-            # Source: <__vie__> + VI
-            src_ids = [self.vi_token_id] + item["input_ids_en"]
-            src_text = item["vi"]
-            # Target: <__eng__> + EN
-            tgt_ids = [self.en_token_id] + item["input_ids_vi"]
-            tgt_text = item["en"]
+            # Source: <__eng__> + EN (Seamless style: Source lang token + Source content)
+            src_ids = [self.en_token_id] + item["input_ids_en"]
+            src_text = item["en"]
+            
+            # Target: <__vie__> + VI (Seamless style: Target lang token + Target content)
+            tgt_ids = [self.vi_token_id] + item["input_ids_vi"]
+            tgt_text = item["vi"]
         # if idx is in the second half -> Vi -> En
         else:
             # map index back to the original range
             real_idx = idx - self.real_len
             item = self.ds[real_idx]
             
-            # Source: <__eng__> + EN
-            src_ids = [self.en_token_id] + item["input_ids_vi"]
-            src_text = item["en"]
-            # Target: <__vie__> + VI
-            tgt_ids = [self.vi_token_id] + item["input_ids_en"]
-            tgt_text = item["vi"]
+            # Source: <__vie__> + VI (Seamless style: Source lang token + Source content)
+            src_ids = [self.vi_token_id] + item["input_ids_vi"]
+            src_text = item["vi"]
+            
+            # Target: <__eng__> + EN (Seamless style: Target lang token + Target content)
+            tgt_ids = [self.en_token_id] + item["input_ids_en"]
+            tgt_text = item["en"]
 
         # add EOS to the end of each sentence
         src_ids = src_ids + [self.eos_id]
@@ -88,7 +90,8 @@ class Collator:
     def __call__(self, batch):
         src_batch = [{"input_ids": x["src_ids"]} for x in batch]
         tgt_batch = [{"input_ids": x["tgt_ids"]} for x in batch]
-
+        src_text = [x["src_text"] for x in batch]
+        tgt_text = [x["tgt_text"] for x in batch]
         # Padding
         src_pad = self.tokenizer.pad(src_batch, pad_to_multiple_of=8, padding_side="right", return_attention_mask=True, return_tensors="pt")
         tgt_pad = self.tokenizer.pad(tgt_batch, pad_to_multiple_of=8, padding_side="right", return_attention_mask=True, return_tensors="pt")
@@ -105,8 +108,10 @@ class Collator:
 
         return {
             "src_input_ids": source_ids,
+            "src_text": src_text,
             "src_attention_mask": src_mask,
             "tgt_input_ids": dec_input,
+            "tgt_text": tgt_text,
             "tgt_attention_mask": dec_mask,
             "labels": labels
         }
