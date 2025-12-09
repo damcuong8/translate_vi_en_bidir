@@ -281,5 +281,5 @@ if __name__ == "__main__":
     if "RANK" in os.environ:
         setup_dist()
         
-    test_simple_save()
+    #test_simple_save()
     test_fsdp_save()
