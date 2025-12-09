@@ -6,7 +6,7 @@ import torch.optim as optim
 import torch.distributed as dist
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.utils.data import DataLoader
-from torch.cuda.amp import GradScaler
+from torch.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
 from torch.amp import autocast
 import wandb
 from tqdm import tqdm
@@ -126,7 +126,7 @@ def train_fsdp(config: Optional[dict] = None):
     # Initialize AMP GradScaler
     use_amp = config.get('use_amp', True)
     amp_dtype = torch.float16 if config.get('amp_dtype', 'fp16') == 'fp16' else torch.bfloat16
-    scaler = GradScaler(enabled=use_amp)
+    scaler = ShardedGradScaler(enabled=use_amp)
     
     # Gradient clipping config
     max_grad_norm = config.get('max_grad_norm', 1.0)
