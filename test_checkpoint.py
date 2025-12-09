@@ -156,7 +156,7 @@ def test_fsdp_save():
         "save_optimizer_state": True,
         "sharding_strategy": "FULL_SHARD",
         "use_mixed_precision": False,
-        "cpu_offload": True,
+        "cpu_offload": False,
         "checkpoint_dir": "./test_output_fsdp/checkpoints" # Ensure this is set
     }
     
