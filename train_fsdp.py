@@ -181,7 +181,7 @@ def train_fsdp(config: Optional[dict] = None):
         val_losses = []
         with torch.no_grad():
             for step, batch in enumerate(val_pbar):
-                batch = {k: v.to(local_rank) for k, v in batch.items()}
+                batch = {k: v.to(local_rank) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
                 
                 # Use autocast for validation too
                 with autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
@@ -241,7 +241,7 @@ def train_fsdp(config: Optional[dict] = None):
         accumulated_loss = 0.0
         
         for step, batch in enumerate(train_pbar):
-            batch = {k: v.to(local_rank) for k, v in batch.items()}
+            batch = {k: v.to(local_rank) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
             
             # Determine if we are accumulating gradients (no sync)
             is_accumulating = (step + 1) % gradient_accumulation_steps != 0

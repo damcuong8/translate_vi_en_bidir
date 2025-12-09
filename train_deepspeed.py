@@ -133,7 +133,7 @@ def train_deepspeed(config: Optional[dict] = None, ds_config: Optional[dict] = N
         )
         
         for step, batch in enumerate(train_pbar):
-            batch = {k: v.to(model_engine.device) for k, v in batch.items()}
+            batch = {k: v.to(model_engine.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
 
             logits, loss_lm, enc_aux_loss, dec_aux_loss = model_engine(batch['src_input_ids'], batch['src_attention_mask'], batch['tgt_input_ids'], batch['tgt_attention_mask'], batch['labels'])
             
@@ -172,7 +172,7 @@ def train_deepspeed(config: Optional[dict] = None, ds_config: Optional[dict] = N
         
         with torch.no_grad():
             for step, batch in enumerate(val_pbar):
-                batch = {k: v.to(model_engine.device) for k, v in batch.items()}
+                batch = {k: v.to(model_engine.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
                 logits, loss_lm, enc_aux_loss, dec_aux_loss = model_engine(batch['src_input_ids'], batch['src_attention_mask'], batch['tgt_input_ids'], batch['tgt_attention_mask'], batch['labels'])
                 total_loss = loss_lm + enc_aux_loss + dec_aux_loss
                 
