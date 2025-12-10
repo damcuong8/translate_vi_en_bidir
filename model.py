@@ -154,15 +154,9 @@ class RotaryEmbedding(nn.Module):
         key: torch.Tensor,
         position_ids: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Extend cache if position_ids exceed current cache size
-        max_pos = position_ids.max().item()
         
-        # Ensure cache is on the same device as query
-        cos = self.cos_cached.to(query.device)
-        sin = self.sin_cached.to(query.device)
-        
-        query = _apply_rotary_emb(query, cos, sin, position_ids)
-        key = _apply_rotary_emb(key, cos, sin, position_ids)
+        query = _apply_rotary_emb(query, self.cos_cached, self.sin_cached, position_ids)
+        key = _apply_rotary_emb(key, self.cos_cached, self.sin_cached, position_ids)
 
         return query, key
     
