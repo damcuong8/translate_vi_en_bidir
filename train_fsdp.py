@@ -20,6 +20,7 @@ from transformers import AutoTokenizer
 from utils import wrap_model_with_fsdp, create_cosine_scheduler
 from checkpoint_utils import save_checkpoint
 from contextlib import nullcontext
+from evaluate import calculate_metrics
 
 # Setup logging
 logger = logging.getLogger(__name__)
@@ -207,97 +208,103 @@ def train_fsdp(config: Optional[dict] = None):
             disable=rank != 0
         )
         
-        val_losses = []
+        predictions = []
+        references = []
+        
         with torch.no_grad():
             for step, batch in enumerate(val_pbar):
                 batch = {k: v.to(local_rank) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
                 
-                # Use autocast for validation too
+                # Validation with Generation (No Teacher Forcing)
+                src_input_ids = batch['src_input_ids']
+                src_attention_mask = batch['src_attention_mask']
+                
+                # Prepare start tokens: [BOS, Lang_Token]
+                # Assuming batch['tgt_input_ids'] starts with these
+                tgt_start_ids = batch['tgt_input_ids'][:, :2]
+                
+                bs = src_input_ids.size(0)
+                max_gen_len = 152
+                
                 with autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
-                    logits, loss_lm, enc_aux_loss, dec_aux_loss = model(
-                        batch['src_input_ids'], 
-                        batch['src_attention_mask'], 
-                        batch['tgt_input_ids'], 
-                        batch['tgt_attention_mask'], 
-                        batch['labels']
-                    )
-                    total_loss = loss_lm + enc_aux_loss + dec_aux_loss
+                    # Encode
+                    src_mask = (src_attention_mask == 0).unsqueeze(1).unsqueeze(2)
+                    encoder_output, _ = model.encoder(src_input_ids, mask=src_mask)
+                    
+                    decoder_input = tgt_start_ids
+                    
+                    # Fixed-step generation loop for FSDP synchronization
+                    for _ in range(max_gen_len):
+                        decoder_output, _ = model.decoder(
+                            decoder_input,
+                            encoder_output,
+                            tgt_mask=None,
+                            src_mask=src_mask
+                        )
+                        
+                        # Project to vocab
+                        logits = model.lm_head(model.norm(decoder_output[:, -1]))
+                        next_tokens = torch.argmax(logits, dim=-1)
+                        
+                        decoder_input = torch.cat([decoder_input, next_tokens.unsqueeze(1)], dim=1)
                 
-                val_losses.append(total_loss.item())
+                generated_ids = decoder_input
                 
-                # Update tqdm progress bar
-                val_pbar.set_postfix({'eval_loss': f'{total_loss.item():.4f}'})
-
-                if rank == 0 and step % 1000 == 0:
-                    with torch.no_grad():
-                        src_text_log = batch['src_text'][0]
-                        tgt_text_log = batch['tgt_text'][0]
-                        
-                        # Simple Greedy Decoding for logging
-                        curr_src_ids = batch['src_input_ids'][0].unsqueeze(0)
-                        curr_src_mask = batch['src_attention_mask'][0].unsqueeze(0)
-                        
-                        # Start with BOS
-                        curr_tgt_ids = torch.tensor([[tokenizer.bos_token_id]], device=local_rank)
-                        generated_ids = []
-                        
-                        for _ in range(152): # Max gen length
-                            curr_tgt_mask = torch.ones(curr_tgt_ids.shape, device=local_rank)
-                            dummy_labels = torch.zeros_like(curr_tgt_ids)
-                            
-                            gen_logits, _, _, _ = model(
-                                curr_src_ids, 
-                                curr_src_mask, 
-                                curr_tgt_ids, 
-                                curr_tgt_mask, 
-                                dummy_labels
-                            )
-                            
-                            next_token_id = torch.argmax(gen_logits[0, -1, :]).item()
-                            
-                            if next_token_id == tokenizer.eos_token_id:
-                                break
-                            
-                            generated_ids.append(next_token_id)
-                            curr_tgt_ids = torch.cat([curr_tgt_ids, torch.tensor([[next_token_id]], device=local_rank)], dim=1)
-                            
-                        pred_text_log = tokenizer.decode(generated_ids, skip_special_tokens=False)
-                        
-                        logger.info(f"\nStep {step} | Src: {src_text_log}")
-                        logger.info(f"Ref: {tgt_text_log}")
-                        logger.info(f"Pred: {pred_text_log}\n")
-                        
-                        if wandb.run is not None:
-                            wandb.log({
-                                "validation_samples": wandb.Table(
-                                    columns=["Step", "Source", "Reference", "Prediction"],
-                                    data=[[step, src_text_log, tgt_text_log, pred_text_log]]
-                                )
-                            }, commit=False)
+                # Collect predictions and references
+                # Decode on all ranks, but only rank 0 usually logs/computes metrics?
+                # Actually, to compute metrics over the whole dataset, we should gather results.
+                # For simplicity, we can just compute metrics on each rank's subset and average them,
+                # or just let Rank 0 compute metrics on its subset (if shuffled, might be representative).
+                # But Val set is usually not shuffled in distributed sampler? 
+                # DistributedSampler shuffles by default.
                 
-                # Log periodically during validation
-                if rank == 0 and step % 10 == 0:
-                    if wandb.run is not None:
+                # Let's decode locally
+                for i in range(bs):
+                    # Prediction
+                    pred_tokens = generated_ids[i, 2:].tolist() # Skip start tokens
+                    try:
+                        eos_idx = pred_tokens.index(tokenizer.eos_token_id)
+                        pred_tokens = pred_tokens[:eos_idx]
+                    except ValueError:
+                        pass
+                    pred_text = tokenizer.decode(pred_tokens)
+                    predictions.append(pred_text)
+                    
+                    # Reference
+                    ref_text = batch['tgt_text'][i]
+                    references.append(ref_text)
+                
+                # Logging samples (Rank 0 only)
+                if rank == 0 and step % 100 == 0:
+                     logger.info(f"\nStep {step} | Src: {batch['src_text'][0]}")
+                     logger.info(f"Ref: {batch['tgt_text'][0]}")
+                     logger.info(f"Pred: {predictions[-bs]}") # Last batch first item
+                     
+                     if wandb.run is not None:
                         wandb.log({
-                            "eval_loss": total_loss.item(),
-                            "eval_loss_lm": loss_lm.item(),
-                            "eval_enc_aux_loss": enc_aux_loss.item(),
-                            "eval_dec_aux_loss": dec_aux_loss.item(),
-                            "eval_step": step,
-                            "eval_epoch": curr_epoch
-                        })
+                            "validation_samples": wandb.Table(
+                                columns=["Step", "Source", "Reference", "Prediction"],
+                                data=[[curr_step, batch['src_text'][0], batch['tgt_text'][0], predictions[-bs]]]
+                            )
+                        }, commit=False)
+
+        # Calculate Metrics
+        metrics = calculate_metrics(predictions, references)
         
-        # Log average validation loss
-        avg_val_loss = sum(val_losses) / len(val_losses) if val_losses else 0
+        # Aggregate metrics across ranks?
+        # For now, just logging local rank metrics or Rank 0 metrics.
+        # Ideally we should gather all predictions. 
+        # But let's keep it simple: Rank 0 logs its metrics.
+        
         if rank == 0:
-            logger.info(f"{desc} | Avg Validation Loss: {avg_val_loss:.4f}")
+            logger.info(f"{desc} | BLEU: {metrics['bleu']:.4f} | SacreBLEU: {metrics['sacre_bleu']:.4f}")
             if wandb.run is not None:
-                log_data = {
-                    "avg_eval_loss": avg_val_loss,
+                wandb.log({
+                    "eval_bleu": metrics['bleu'],
+                    "eval_sacre_bleu": metrics['sacre_bleu'],
                     "epoch": curr_epoch,
                     "global_step": curr_step
-                }
-                wandb.log(log_data)
+                })
         
         model.train()
 
@@ -318,20 +325,6 @@ def train_fsdp(config: Optional[dict] = None):
         
         for step, batch in enumerate(train_pbar):
             batch = {k: v.to(local_rank) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-            
-            # --- DEBUG: Inspect Training Data ---
-            if rank == 0 and step % 5 == 0:
-                logger.info("\n--- DEBUG: First Batch Training Data ---")
-                logger.info(f"Src IDs: {batch['src_input_ids'][0].tolist()}")
-                logger.info(f"Tgt IDs: {batch['tgt_input_ids'][0].tolist()}")
-                logger.info(f"Src Text (Decoded): {tokenizer.decode(batch['src_input_ids'][0], skip_special_tokens=False)}")
-                logger.info(f"Tgt Text (Decoded): {tokenizer.decode(batch['tgt_input_ids'][0], skip_special_tokens=False)}")
-                if 'src_text' in batch:
-                    logger.info(f"Src Text (Original): {batch['src_text'][0]}")
-                if 'tgt_text' in batch:
-                    logger.info(f"Tgt Text (Original): {batch['tgt_text'][0]}")
-                logger.info("----------------------------------------\n")
-            # ------------------------------------
 
             # Determine if we are accumulating gradients (no sync)
             is_accumulating = (step + 1) % gradient_accumulation_steps != 0

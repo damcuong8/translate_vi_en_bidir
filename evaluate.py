@@ -17,7 +17,7 @@ from checkpoint_utils import load_checkpoint, _has_dcp_artifacts, _resolve_check
 from transformers import AutoTokenizer
 from dataset import Collator
 
-from torchmetrics.text import CharErrorRate, WordErrorRate, BLEUScore
+from torchmetrics.text import BLEUScore, SacreBLEUScore
 
 class EvaluationDataset(Dataset):
     """Dataset for evaluating a single translation direction."""
@@ -295,22 +295,14 @@ def calculate_metrics(predictions, references):
     except Exception as e:
         print(f"BLEU Error: {e}")
         metrics['bleu'] = 0.0
-        
-    # WER
+
+    # SacreBLEU
     try:
-        wer = WordErrorRate()
-        metrics['wer'] = wer(predictions, references).item()
+        sacre_bleu = SacreBLEUScore()
+        metrics['sacre_bleu'] = sacre_bleu(predictions, [[r] for r in references]).item()
     except Exception as e:
-        print(f"WER Error: {e}")
-        metrics['wer'] = 1.0
-        
-    # CER
-    try:
-        cer = CharErrorRate()
-        metrics['cer'] = cer(predictions, references).item()
-    except Exception as e:
-        print(f"CER Error: {e}")
-        metrics['cer'] = 1.0
+        print(f"SacreBLEU Error: {e}")
+        metrics['sacre_bleu'] = 0.0
         
     return metrics
 
@@ -381,8 +373,7 @@ def evaluate_direction(model, tokenizer, config, dataset_path, src_lang, tgt_lan
     
     print(f"Results for {src_lang}->{tgt_lang}:")
     print(f"BLEU: {metrics['bleu']:.4f}")
-    print(f"WER: {metrics['wer']:.4f}")
-    print(f"CER: {metrics['cer']:.4f}")
+    print(f"SacreBLEU: {metrics['sacre_bleu']:.4f}")
     
     # Save results
     output_dir = Path("evaluation_results")
@@ -424,8 +415,7 @@ def evaluate_direction(model, tokenizer, config, dataset_path, src_lang, tgt_lan
         f.write(f"Total samples: {len(predictions)}\n")
         f.write(f"\nMetrics:\n")
         f.write(f"BLEU: {metrics['bleu']:.4f}\n")
-        f.write(f"WER: {metrics['wer']:.4f}\n")
-        f.write(f"CER: {metrics['cer']:.4f}\n")
+        f.write(f"SacreBLEU: {metrics['sacre_bleu']:.4f}\n")
         f.write(f"\n{'='*80}\n")
         f.write(f"Sample Examples (first 10):\n")
         f.write(f"{'='*80}\n\n")
@@ -444,8 +434,7 @@ def evaluate_direction(model, tokenizer, config, dataset_path, src_lang, tgt_lan
         "total_samples": len(predictions),
         "metrics": {
             "bleu": float(metrics['bleu']),
-            "wer": float(metrics['wer']),
-            "cer": float(metrics['cer'])
+            "sacre_bleu": float(metrics['sacre_bleu'])
         },
         "files": {
             "predictions": str(pred_file),
