@@ -8,6 +8,7 @@ import hashlib
 from pathlib import Path
 from typing import List, Optional
 from torch.utils.data import Dataset, DataLoader
+from torch.distributed.checkpoint import dcp_to_torch_save
 from datasets import load_from_disk
 
 from model import build_transformer, ModelConfig
@@ -89,51 +90,6 @@ class EvaluationDataset(Dataset):
             "tgt_text": tgt_text
         }
 
-def dcp_to_torch_save(dcp_path, output_path):
-    """
-    Convert a Distributed Checkpoint (DCP) to a standard PyTorch binary file.
-    """
-    print(f"Converting DCP {dcp_path} to {output_path}...")
-    device = 'cpu' # Use CPU for conversion
-    
-    # Load default config
-    config_dict = get_kaggle_config()
-    
-    # Tokenizer for vocab size
-    tokenizer_path = config_dict.get('tokenizer_path')
-    if not tokenizer_path or not os.path.exists(tokenizer_path):
-            if os.path.exists("tokenizer"):
-                tokenizer_path = "tokenizer"
-    
-    try:
-        tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
-    except Exception as e:
-        print(f"Warning: Could not load tokenizer for conversion: {e}")
-        # Fallback to default vocab size if tokenizer fails? 
-        # But ModelConfig default is 24000.
-        # Let's hope it works or user provided valid path in config/default.
-        raise
-        
-    model_config = ModelConfig(vocab_size=tokenizer.vocab_size)
-    
-    # Build model
-    model = build_transformer(config=model_config)
-    model = model.to(device)
-    
-    # Load DCP
-    load_checkpoint(
-        checkpoint_path=dcp_path,
-        model=model,
-        optimizer=None,
-        scheduler=None,
-        config=config_dict,
-        strict=False
-    )
-    
-    # Save
-    torch.save(model.state_dict(), output_path)
-    print("Conversion complete.")
-
 def _ensure_torch_checkpoint(path: str) -> str:
     """Convert DCP shards to pytorch_model.bin if needed."""
     if os.path.isfile(path):
@@ -154,11 +110,18 @@ def _ensure_torch_checkpoint(path: str) -> str:
         if has_dcp:
             print("  Detected DCP checkpoint; converting to pytorch_model.bin ...")
             try:
-                dcp_to_torch_save(path, candidate)
+                # Use torch's built-in dcp_to_torch_save function
+                # Load state dict from DCP and save to torch format
+                dcp_to_torch_save(
+                    dcp_checkpoint_dir=path,
+                    torch_save_path=candidate,
+                )
                 print(f"  ✓ Materialized Torch checkpoint at {candidate}")
                 return candidate
             except Exception as exc:
                 print(f"  ❌ Failed to convert DCP checkpoint: {exc}")
+                import traceback
+                traceback.print_exc()
 
     return path
 
