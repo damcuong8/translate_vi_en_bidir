@@ -245,8 +245,6 @@ class AttentionBlock(nn.Module):
                 causal_mask = torch.triu(torch.ones((seq_len, seq_len), device=x.device), diagonal=1).bool()
                 mask = mask | causal_mask
             is_causal = False
-            print(f"mask: {mask}")
-            print(f"~mask: {~mask}")
 
         if self.config.use_sdpa_kernel:
             with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
@@ -720,7 +718,7 @@ class Transformer(nn.Module):
         encoder_output, encoder_aux_loss = self.encoder(src_input_ids, mask=src_mask)
         decoder_output, decoder_aux_loss = self.decoder(tgt_input_ids, encoder_output, tgt_mask=tgt_mask, src_mask=src_mask)
         logits = self.lm_head(self.norm(decoder_output))
-        
+
         loss_lm = F.cross_entropy(logits.view(-1, self.config.vocab_size), labels.view(-1))
         
         return logits, loss_lm, encoder_aux_loss, decoder_aux_loss
