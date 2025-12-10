@@ -235,6 +235,7 @@ class AttentionBlock(nn.Module):
         # Ensure causal mask is only used for self-attention
         is_causal = self.causal_mask and not is_cross_attention
         
+        attn_mask = None
         if mask is not None:
             # SDPA does not support is_causal=True with a mask.
             # If we have a mask (e.g. for padding) and need causal masking,
@@ -245,12 +246,13 @@ class AttentionBlock(nn.Module):
                 causal_mask = torch.triu(torch.ones((seq_len, seq_len), device=x.device), diagonal=1).bool()
                 mask = mask | causal_mask
             is_causal = False
+            attn_mask = ~mask
 
         if self.config.use_sdpa_kernel:
             with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
-                t = F.scaled_dot_product_attention(q, k, v, attn_mask=~mask, dropout_p=0.0, is_causal=is_causal)
+                t = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=0.0, is_causal=is_causal)
         else:
-            t = F.scaled_dot_product_attention(q, k, v, attn_mask=~mask, dropout_p=0.0, is_causal=is_causal)
+            t = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=0.0, is_causal=is_causal)
         
         # Reshape back: [Batch, Heads, Seq, HeadDim] -> [Batch, Seq, Hidden]
         t = t.transpose(1, 2).contiguous().view(batch_size, seq_len, self.head_dim * self.num_attention_heads)
