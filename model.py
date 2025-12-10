@@ -35,6 +35,7 @@ class ModelConfig:
     use_sdpa_kernel: bool = False
     w_load_loss: float = 0.01
     w_importance_loss: float = 0.01
+    w_z_loss: float = 0.001
     w_aux_loss: float = 0.001
     use_deepspeed_moe: bool = False
     use_fsdp_moe: bool = True
@@ -298,6 +299,7 @@ class MOEBlock(nn.Module):
         self.experts_end_idx = self.experts_start_idx + self.num_local_experts
         self.w_load_loss = config.w_load_loss
         self.w_importance_loss = config.w_importance_loss
+        self.w_z_loss = config.w_z_loss
         self.w_aux_loss = config.w_aux_loss
         self.gate = nn.Linear(
             config.hidden_size, config.num_route_experts, device=device
@@ -361,7 +363,11 @@ class MOEBlock(nn.Module):
             self.w_importance_loss * (cv ** 2)
         )
 
-        aux_loss = self.w_aux_loss * (loss_load_balancing + importance_loss)
+        # z-loss
+        z_loss = torch.logsumexp(gate_logits, dim=-1).pow(2).mean()
+        weighted_z_loss = self.w_z_loss * z_loss
+
+        aux_loss = self.w_aux_loss * (loss_load_balancing + importance_loss + weighted_z_loss)
 
         return output, aux_loss
 
@@ -377,6 +383,7 @@ class FSDPMoEBlock(nn.Module):
         self.num_activated_experts = config.num_activated_experts
         self.w_load_loss = config.w_load_loss
         self.w_importance_loss = config.w_importance_loss
+        self.w_z_loss = config.w_z_loss
         self.w_aux_loss = config.w_aux_loss
         self.gate = nn.Linear(
             config.hidden_size, config.num_route_experts, device=device
@@ -439,7 +446,11 @@ class FSDPMoEBlock(nn.Module):
             self.w_importance_loss * (cv ** 2)
         )
 
-        aux_loss = self.w_aux_loss * (loss_load_balancing + importance_loss)
+        # z-loss
+        z_loss = torch.logsumexp(gate_logits, dim=-1).pow(2).mean()
+        weighted_z_loss = self.w_z_loss * z_loss
+
+        aux_loss = self.w_aux_loss * (loss_load_balancing + importance_loss + weighted_z_loss)
 
         return output, aux_loss
 

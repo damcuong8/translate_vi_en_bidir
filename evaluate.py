@@ -4,17 +4,90 @@ from tqdm import tqdm
 import time
 import os
 import json
+import hashlib
 from pathlib import Path
 from typing import List, Optional
+from torch.utils.data import Dataset, DataLoader
+from datasets import load_from_disk
 
-# Imports from codebase
 from model import build_transformer, ModelConfig
 from config import get_kaggle_config
 from checkpoint_utils import load_checkpoint, _has_dcp_artifacts, _resolve_checkpoint_dir
 from transformers import AutoTokenizer
+from dataset import Collator
 
-# Import metrics
 from torchmetrics.text import CharErrorRate, WordErrorRate, BLEUScore
+
+class EvaluationDataset(Dataset):
+    """Dataset for evaluating a single translation direction."""
+    def __init__(self, dataset_path, tokenizer, src_lang_token, tgt_lang_token, direction="en_to_vi", max_seq_len=152):
+        """
+        Args:
+            dataset_path: Path to the dataset on disk
+            tokenizer: Tokenizer instance
+            src_lang_token: Source language token (e.g., "__eng__")
+            tgt_lang_token: Target language token (e.g., "__vie__")
+            direction: "en_to_vi" or "vi_to_en"
+            max_seq_len: Maximum sequence length
+        """
+        self.ds = load_from_disk(dataset_path)
+        original_count = len(self.ds)
+        print(f"Original dataset count: {original_count}")
+        
+        # Setup writable cache directory for filtering
+        cache_dir = "/tmp/translate_vi_en_cache"
+        os.makedirs(cache_dir, exist_ok=True)
+        
+        # Create a consistent cache filename based on dataset path and parameters
+        safe_name = os.path.basename(dataset_path)
+        ds_hash = hashlib.md5(dataset_path.encode()).hexdigest()[:8]
+        cache_file_name = os.path.join(cache_dir, f"filtered_{safe_name}_{ds_hash}_{max_seq_len}.arrow")
+
+        # Filter sequences longer than max_seq_len
+        self.ds = self.ds.filter(
+            lambda x: (len(x["input_ids_en"]) <= max_seq_len) and (len(x["input_ids_vi"]) <= max_seq_len),
+            num_proc=min(os.cpu_count(), 4),
+            cache_file_name=cache_file_name
+        )
+        filtered_count = len(self.ds)
+        print(f"Filtered dataset count: {filtered_count}")
+        print(f"Removed {original_count - filtered_count} samples due to length > {max_seq_len}")
+        
+        self.tokenizer = tokenizer
+        self.direction = direction
+        
+        self.bos_id = tokenizer.bos_token_id
+        self.eos_id = tokenizer.eos_token_id
+        
+        self.src_token_id = tokenizer.convert_tokens_to_ids(src_lang_token)
+        self.tgt_token_id = tokenizer.convert_tokens_to_ids(tgt_lang_token)
+        
+    def __len__(self):
+        return len(self.ds)
+    
+    def __getitem__(self, idx):
+        item = self.ds[idx]
+        
+        # Determine source and target based on direction
+        if self.direction == "en_to_vi":
+            # English to Vietnamese
+            src_ids = [self.src_token_id] + item["input_ids_en"] + [self.eos_id]
+            tgt_ids = [self.bos_id, self.tgt_token_id] + item["input_ids_vi"] + [self.eos_id]
+            src_text = item["en"]
+            tgt_text = item["vi"]
+        else:
+            # Vietnamese to English
+            src_ids = [self.src_token_id] + item["input_ids_vi"] + [self.eos_id]
+            tgt_ids = [self.bos_id, self.tgt_token_id] + item["input_ids_en"] + [self.eos_id]
+            src_text = item["vi"]
+            tgt_text = item["en"]
+        
+        return {
+            "src_ids": torch.tensor(src_ids, dtype=torch.long),
+            "tgt_ids": torch.tensor(tgt_ids, dtype=torch.long),
+            "src_text": src_text,
+            "tgt_text": tgt_text
+        }
 
 def dcp_to_torch_save(dcp_path, output_path):
     """
@@ -230,103 +303,60 @@ def greedy_decode(model, encoder_input, encoder_mask, tokenizer, tgt_lang_token,
     # Exclude BOS and Lang Token from output
     return decoder_input.squeeze().tolist()[2:] 
 
-def batch_translate(model, sentences, tokenizer, src_lang, tgt_lang, device, batch_size=32, max_len=500, config=None):
+def batch_translate_with_dataloader(model, dataloader, tokenizer, tgt_lang_token, device, max_len=256):
     """
-    Translate a list of sentences.
+    Translate using a DataLoader.
+    Returns predictions and references.
     """
     model.eval()
-    translations = []
+    predictions = []
+    references = []
     
-    # Get language tokens
-    lang_token_map = config.get('lang_token_map', {}) if config else {}
-    if not lang_token_map:
-        lang_token_map = {
-            "eng": "__eng__",
-            "vie": "__vie__",
-        }
+    tgt_token_id = tokenizer.convert_tokens_to_ids(tgt_lang_token)
     
-    src_token = lang_token_map.get(src_lang, lang_token_map.get(src_lang[:2], f"__{src_lang}__"))
-    tgt_token = lang_token_map.get(tgt_lang, lang_token_map.get(tgt_lang[:2], f"__{tgt_lang}__"))
-    
-    print(f"Translating {len(sentences)} sentences from {src_lang} ({src_token}) to {tgt_lang} ({tgt_token})...")
-
     with torch.no_grad():
-        for i in tqdm(range(0, len(sentences), batch_size)):
-            batch_sentences = sentences[i:i+batch_size]
+        for batch in tqdm(dataloader, desc="Translating"):
+            src_inputs = batch["src_input_ids"].to(device)
+            src_masks = batch["src_attention_mask"].to(device)
+            src_texts = batch["src_text"]
+            ref_texts = batch["tgt_text"]
             
-            # Prepare batch inputs
-            # [src_token] + content + [eos]
-            src_token_id = tokenizer.convert_tokens_to_ids(src_token)
-            
-            batch_input_ids = []
-            for sent in batch_sentences:
-                tokens = tokenizer.encode(sent, add_special_tokens=False)
-                # Truncate if too long (optional)
-                if len(tokens) > max_len - 2:
-                    tokens = tokens[:max_len-2]
-                batch_input_ids.append([src_token_id] + tokens + [tokenizer.eos_token_id])
-                
-            # Pad
-            max_batch_len = max(len(ids) for ids in batch_input_ids)
-            padded_input_ids = []
-            attention_masks = []
-            
-            for ids in batch_input_ids:
-                pad_len = max_batch_len - len(ids)
-                padded_ids = ids + [tokenizer.pad_token_id] * pad_len
-                mask = [1] * len(ids) + [0] * pad_len
-                padded_input_ids.append(padded_ids)
-                attention_masks.append(mask)
-                
-            src_inputs = torch.tensor(padded_input_ids, dtype=torch.long, device=device)
-            src_masks = torch.tensor(attention_masks, dtype=torch.long, device=device)
-            
-            # Create proper mask for model: (B, 1, 1, S)
-            # The model expects (B, S) where 0 is pad, and converts it internally.
-            # But wait, model.py Transformer.forward does:
-            # src_mask = (src_attention_mask == 0).unsqueeze(1).unsqueeze(2)
-            # So we pass (B, S) src_masks (1 for valid, 0 for pad).
+            # Save references
+            references.extend(ref_texts)
             
             # Encoder
-            # Encoder.forward takes (x, mask)
-            # mask should be (B, 1, 1, S) or compatible. 
-            # Transformer.forward handles the conversion. Here we call encoder directly.
-            # We must convert mask manually.
             enc_mask_expanded = (src_masks == 0).unsqueeze(1).unsqueeze(2)
             encoder_output, _ = model.encoder(src_inputs, mask=enc_mask_expanded)
             
-            # Greedy Decode for batch
-            # Initial decoder input: [bos, tgt_token]
-            tgt_token_id = tokenizer.convert_tokens_to_ids(tgt_token)
-            decoder_input = torch.tensor([[tokenizer.bos_token_id, tgt_token_id]] * len(batch_sentences), dtype=torch.long, device=device)
+            # Greedy Decode
+            batch_size = src_inputs.size(0)
+            decoder_input = torch.tensor(
+                [[tokenizer.bos_token_id, tgt_token_id]] * batch_size, 
+                dtype=torch.long, 
+                device=device
+            )
             
-            finished = torch.zeros(len(batch_sentences), dtype=torch.bool, device=device)
+            finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
             
             for _ in range(max_len):
-                # Decoder mask not needed for attention within decoder (causal handled), 
-                # but we need to mask padding if we were padding decoder input (we aren't, all same length grow together)
-                # However, for Cross-Attention, we need src_mask (enc_mask_expanded).
+                decoder_output, _ = model.decoder(
+                    decoder_input, 
+                    encoder_output, 
+                    tgt_mask=None, 
+                    src_mask=enc_mask_expanded
+                )
                 
-                # Decoder
-                decoder_output, _ = model.decoder(decoder_input, encoder_output, tgt_mask=None, src_mask=enc_mask_expanded)
-                
-                # Project last token
                 logits = model.lm_head(model.norm(decoder_output[:, -1]))
                 next_tokens = torch.argmax(logits, dim=-1)
                 
-                # Update finished status
                 finished |= (next_tokens == tokenizer.eos_token_id)
-                
-                # Append
                 decoder_input = torch.cat([decoder_input, next_tokens.unsqueeze(1)], dim=1)
                 
                 if finished.all():
                     break
             
             # Decode to text
-            for j, seq in enumerate(decoder_input):
-                # Skip [bos, tgt_token] (first 2)
-                # Stop at first eos
+            for seq in decoder_input:
                 tokens = seq[2:].tolist()
                 try:
                     eos_index = tokens.index(tokenizer.eos_token_id)
@@ -335,9 +365,9 @@ def batch_translate(model, sentences, tokenizer, src_lang, tgt_lang, device, bat
                     pass
                 
                 text = tokenizer.decode(tokens)
-                translations.append(text)
-                
-    return translations
+                predictions.append(text)
+    
+    return predictions, references
 
 def calculate_metrics(predictions, references):
     metrics = {}
@@ -369,34 +399,69 @@ def calculate_metrics(predictions, references):
         
     return metrics
 
-def evaluate_direction(model, tokenizer, config, src_file, ref_file, src_lang, tgt_lang, device):
+def evaluate_direction(model, tokenizer, config, dataset_path, src_lang, tgt_lang, device):
     print(f"\nEvaluating Direction: {src_lang} -> {tgt_lang}")
-    print(f"Source: {src_file}")
-    print(f"Reference: {ref_file}")
+    print(f"Dataset: {dataset_path}")
     
-    if not os.path.exists(src_file) or not os.path.exists(ref_file):
-        print("Source or reference file not found. Skipping.")
+    if not os.path.exists(dataset_path):
+        print("Dataset path not found. Skipping.")
         return
-        
-    with open(src_file, 'r', encoding='utf-8') as f:
-        sources = f.read().splitlines()
-    with open(ref_file, 'r', encoding='utf-8') as f:
-        references = f.read().splitlines()
-        
-    if len(sources) != len(references):
-        print("Warning: Source and reference length mismatch. Truncating to shorter.")
-        min_len = min(len(sources), len(references))
-        sources = sources[:min_len]
-        references = references[:min_len]
-        
-    predictions = batch_translate(
-        model, sources, tokenizer, 
-        src_lang=src_lang, tgt_lang=tgt_lang, 
-        device=device,
-        batch_size=config.get('test_batch_size', 32),
-        config=config
+    
+    # Get language tokens
+    lang_token_map = config.get('lang_token_map', {})
+    if not lang_token_map:
+        lang_token_map = {
+            "eng": "__eng__",
+            "vie": "__vie__",
+        }
+    
+    src_token = lang_token_map.get(src_lang, lang_token_map.get(src_lang[:2], f"__{src_lang}__"))
+    tgt_token = lang_token_map.get(tgt_lang, lang_token_map.get(tgt_lang[:2], f"__{tgt_lang}__"))
+    
+    print(f"Using language tokens: {src_token} -> {tgt_token}")
+    
+    # Determine direction
+    if src_lang in ["eng", "en"] and tgt_lang in ["vie", "vi"]:
+        direction = "en_to_vi"
+    elif src_lang in ["vie", "vi"] and tgt_lang in ["eng", "en"]:
+        direction = "vi_to_en"
+    else:
+        # Default to en_to_vi
+        direction = "en_to_vi"
+        print(f"Warning: Unknown language pair {src_lang}->{tgt_lang}, defaulting to en_to_vi")
+    
+    # Create dataset and dataloader
+    eval_dataset = EvaluationDataset(
+        dataset_path=dataset_path,
+        tokenizer=tokenizer,
+        src_lang_token=src_token,
+        tgt_lang_token=tgt_token,
+        direction=direction,
+        max_seq_len=config.get('max_seq_len', 152)
     )
     
+    collator = Collator(tokenizer)
+    eval_dataloader = DataLoader(
+        eval_dataset,
+        batch_size=config.get('test_batch_size', 32),
+        shuffle=False,
+        collate_fn=collator,
+        num_workers=0
+    )
+    
+    print(f"Evaluating {len(eval_dataset)} samples...")
+    
+    # Translate using dataloader
+    predictions, references = batch_translate_with_dataloader(
+        model=model,
+        dataloader=eval_dataloader,
+        tokenizer=tokenizer,
+        tgt_lang_token=tgt_token,
+        device=device,
+        max_len=config.get('max_seq_len', 256)
+    )
+    
+    # Calculate metrics
     metrics = calculate_metrics(predictions, references)
     
     print(f"Results for {src_lang}->{tgt_lang}:")
@@ -410,11 +475,17 @@ def evaluate_direction(model, tokenizer, config, src_file, ref_file, src_lang, t
     timestamp = time.strftime("%Y%m%d-%H%M%S")
     out_path = output_dir / f"eval_{src_lang}_{tgt_lang}_{timestamp}.txt"
     
+    # Get some examples for output
+    example_sources = []
+    for i in range(min(10, len(eval_dataset))):
+        item = eval_dataset[i]
+        example_sources.append(item["src_text"])
+    
     with open(out_path, 'w', encoding='utf-8') as f:
         f.write(f"Metrics:\nBLEU: {metrics['bleu']}\nWER: {metrics['wer']}\nCER: {metrics['cer']}\n\n")
         f.write("Examples:\n")
         for i in range(min(10, len(predictions))):
-            f.write(f"Src: {sources[i]}\nRef: {references[i]}\nPred: {predictions[i]}\n\n")
+            f.write(f"Src: {example_sources[i]}\nRef: {references[i]}\nPred: {predictions[i]}\n\n")
     print(f"Saved details to {out_path}")
 
 def main():
@@ -424,15 +495,11 @@ def main():
     parser.add_argument('--tokenizer_path', type=str, help='Path to tokenizer (overrides config)')
     parser.add_argument('--save_converted_path', type=str, help='Path to save converted standard checkpoint')
     
-    # Evaluation files
-    parser.add_argument('--test_en', type=str, help='Path to English/Source test file')
-    parser.add_argument('--test_vi', type=str, help='Path to Vietnamese/Target test file')
-    
-    # Optional direct specification
-    parser.add_argument('--src_file', type=str, help='Source file for single direction')
-    parser.add_argument('--ref_file', type=str, help='Reference file for single direction')
-    parser.add_argument('--src_lang', type=str, default='eng')
-    parser.add_argument('--tgt_lang', type=str, default='vie')
+    # Evaluation dataset
+    parser.add_argument('--dataset_path', type=str, help='Path to test dataset (processed with load_from_disk)')
+    parser.add_argument('--bidirectional', action='store_true', help='Evaluate both directions (en->vi and vi->en)')
+    parser.add_argument('--src_lang', type=str, default='eng', help='Source language (eng or vie)')
+    parser.add_argument('--tgt_lang', type=str, default='vie', help='Target language (vie or eng)')
     
     args = parser.parse_args()
     
@@ -454,16 +521,20 @@ def main():
         print(f"Reloading tokenizer from {args.tokenizer_path}")
         tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path)
 
-    # Direction 1: En -> Vi (or Src -> Tgt)
-    if args.test_en and args.test_vi:
-        # Bidirectional evaluation
-        evaluate_direction(model, tokenizer, config, args.test_en, args.test_vi, 'en', 'vi', device)
-        evaluate_direction(model, tokenizer, config, args.test_vi, args.test_en, 'vi', 'en', device)
-    elif args.src_file and args.ref_file:
-        # Single direction
-        evaluate_direction(model, tokenizer, config, args.src_file, args.ref_file, args.src_lang, args.tgt_lang, device)
+    # Evaluation
+    if args.dataset_path:
+        if args.bidirectional:
+            # Evaluate both directions
+            print("\n=== Evaluating En -> Vi ===")
+            evaluate_direction(model, tokenizer, config, args.dataset_path, 'eng', 'vie', device)
+            print("\n=== Evaluating Vi -> En ===")
+            evaluate_direction(model, tokenizer, config, args.dataset_path, 'vie', 'eng', device)
+        else:
+            # Single direction
+            evaluate_direction(model, tokenizer, config, args.dataset_path, args.src_lang, args.tgt_lang, device)
     else:
-        print("Please provide --test_en and --test_vi for bidirectional evaluation, or --src_file and --ref_file for single direction.")
+        print("Please provide --dataset_path for evaluation.")
+        print("Example: python evaluate.py --checkpoint model.pt --dataset_path ./test_dataset --bidirectional")
 
 if __name__ == "__main__":
     main()

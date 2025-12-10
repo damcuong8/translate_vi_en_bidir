@@ -1,6 +1,8 @@
 import argparse
 import json
 import os
+import sys
+import logging
 import torch
 import torch.optim as optim
 import torch.distributed as dist
@@ -19,6 +21,26 @@ from utils import wrap_model_with_fsdp, create_cosine_scheduler
 from checkpoint_utils import save_checkpoint
 from contextlib import nullcontext
 
+# Setup logging
+logger = logging.getLogger(__name__)
+
+def setup_logging(rank: int):
+    """
+    Setup logging configuration
+    """
+    # Only setup handlers for rank 0 or if needed
+    if rank != 0:
+        return
+        
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        handlers=[
+            logging.StreamHandler(sys.stdout),
+            logging.FileHandler("train_fsdp.log", mode="a", encoding="utf-8")
+        ]
+    )
+
 def train_fsdp(config: Optional[dict] = None):
     # Setup distributed
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -27,9 +49,14 @@ def train_fsdp(config: Optional[dict] = None):
     rank = dist.get_rank()
     world_size = dist.get_world_size()
 
+    # Setup logging
+    setup_logging(rank)
+
     if config is None:
         config = get_kaggle_config()
     
+    if rank == 0:
+        logger.info(f"Starting FSDP training with config: {json.dumps(config, indent=2, default=str)}")
     tokenizer = AutoTokenizer.from_pretrained(config['tokenizer_path'])
     train_dataset = BidirectionalDataset(
         dataset_path=config['train_hf_dataset_path'],
@@ -80,41 +107,43 @@ def train_fsdp(config: Optional[dict] = None):
     fsdp_model = model
 
     if rank == 0:
-        print(f"Model wrapped with FSDP: \n{model}")
+        logger.info(f"Model wrapped with FSDP: \n{model}")
         
         def check_fsdp_unit(name, module):
             is_fsdp = isinstance(module, FSDP)
             unit_id = id(module)
             weight_id = id(module.weight) if hasattr(module, "weight") else None
-            print(f"[{name}] Is FSDP: {is_fsdp}, Unit ID: {unit_id}, Weight ID: {weight_id}")
+            logger.info(f"[{name}] Is FSDP: {is_fsdp}, Unit ID: {unit_id}, Weight ID: {weight_id}")
             return unit_id
 
-        print("--- Checking FSDP Wrapping & Shared Embeddings ---")
+        logger.info("--- Checking FSDP Wrapping & Shared Embeddings ---")
         shared_unit = check_fsdp_unit("Shared Embedding", model.shared)
         
         if hasattr(model.encoder, "embedding"):
              enc_unit = check_fsdp_unit("Encoder Embedding", model.encoder.embedding)
              if shared_unit != enc_unit:
-                 print(f"Warning: Shared and Encoder Embedding are different units/objects!")
+                 logger.warning(f"Warning: Shared and Encoder Embedding are different units/objects!")
              else:
-                 print("Shared and Encoder Embedding are the SAME unit/object.")
+                 logger.info("Shared and Encoder Embedding are the SAME unit/object.")
 
         if hasattr(model.decoder, "embedding"):
              dec_unit = check_fsdp_unit("Decoder Embedding", model.decoder.embedding)
              if shared_unit != dec_unit:
-                 print(f"Warning: Shared and Decoder Embedding are different units/objects!")
+                 logger.warning(f"Warning: Shared and Decoder Embedding are different units/objects!")
              else:
-                 print("Shared and Decoder Embedding are the SAME unit/object.")
+                 logger.info("Shared and Decoder Embedding are the SAME unit/object.")
 
-        print(f"LM Head weight pointer: {id(model.lm_head.weight)}")
-        print("------------------------------------------------")
+        logger.info(f"LM Head weight pointer: {id(model.lm_head.weight)}")
+        logger.info("------------------------------------------------")
 
 
     if config['use_torch_compile']:
         model = torch.compile(model)
-        print("Model compiled with torch.compile")
+        if rank == 0:
+            logger.info("Model compiled with torch.compile")
     else:
-        print("Model not compiled with torch.compile")
+        if rank == 0:
+            logger.info("Model not compiled with torch.compile")
 
     # Calculate training steps
     gradient_accumulation_steps = config.get('gradient_accumulation_steps', 1)
@@ -138,20 +167,20 @@ def train_fsdp(config: Optional[dict] = None):
     if rank == 0:
         wandb_config = config.get("wandb", {})
         if wandb_config.get("enabled", True):
-            print(f"Initializing wandb project: {wandb_config.get('project', 'Translate-Vi-En')}")
+            logger.info(f"Initializing wandb project: {wandb_config.get('project', 'Translate-Vi-En')}")
             wandb.init(
                 project=wandb_config.get("project", "Translate-Vi-En"),
                 name=wandb_config.get("name", "fsdp_run"),
                 config=config
             )
-        print(f"==================================================")
-        print(f"FSDP Training Started. World Size: {world_size}")
-        print(f"AMP Enabled: {use_amp}, Dtype: {amp_dtype}")
-        print(f"Gradient Clipping: max_norm={max_grad_norm}")
-        print(f"Gradient Accumulation Steps: {gradient_accumulation_steps}")
-        print(f"Total Training Steps: {num_training_steps}")
-        print(f"Save Steps: {save_steps}, Save Total Limit: {save_total_limit}")
-        print(f"==================================================")
+        logger.info(f"==================================================")
+        logger.info(f"FSDP Training Started. World Size: {world_size}")
+        logger.info(f"AMP Enabled: {use_amp}, Dtype: {amp_dtype}")
+        logger.info(f"Gradient Clipping: max_norm={max_grad_norm}")
+        logger.info(f"Gradient Accumulation Steps: {gradient_accumulation_steps}")
+        logger.info(f"Total Training Steps: {num_training_steps}")
+        logger.info(f"Save Steps: {save_steps}, Save Total Limit: {save_total_limit}")
+        logger.info(f"==================================================")
         if wandb.run is not None:
              wandb.config.update({
                  "fsdp": True,
@@ -199,7 +228,7 @@ def train_fsdp(config: Optional[dict] = None):
                 # Update tqdm progress bar
                 val_pbar.set_postfix({'eval_loss': f'{total_loss.item():.4f}'})
 
-                if rank == 0 and step % 100 == 0:
+                if rank == 0 and step % 1000 == 0:
                     with torch.no_grad():
                         src_text_log = batch['src_text'][0]
                         tgt_text_log = batch['tgt_text'][0]
@@ -212,7 +241,7 @@ def train_fsdp(config: Optional[dict] = None):
                         curr_tgt_ids = torch.tensor([[tokenizer.bos_token_id]], device=local_rank)
                         generated_ids = []
                         
-                        for _ in range(100): # Max gen length
+                        for _ in range(152): # Max gen length
                             curr_tgt_mask = torch.ones(curr_tgt_ids.shape, device=local_rank)
                             dummy_labels = torch.zeros_like(curr_tgt_ids)
                             
@@ -234,9 +263,9 @@ def train_fsdp(config: Optional[dict] = None):
                             
                         pred_text_log = tokenizer.decode(generated_ids, skip_special_tokens=False)
                         
-                        print(f"\nStep {step} | Src: {src_text_log}")
-                        print(f"Ref: {tgt_text_log}")
-                        print(f"Pred: {pred_text_log}\n")
+                        logger.info(f"\nStep {step} | Src: {src_text_log}")
+                        logger.info(f"Ref: {tgt_text_log}")
+                        logger.info(f"Pred: {pred_text_log}\n")
                         
                         if wandb.run is not None:
                             wandb.log({
@@ -261,7 +290,7 @@ def train_fsdp(config: Optional[dict] = None):
         # Log average validation loss
         avg_val_loss = sum(val_losses) / len(val_losses) if val_losses else 0
         if rank == 0:
-            print(f"{desc} | Avg Validation Loss: {avg_val_loss:.4f}")
+            logger.info(f"{desc} | Avg Validation Loss: {avg_val_loss:.4f}")
             if wandb.run is not None:
                 log_data = {
                     "avg_eval_loss": avg_val_loss,
