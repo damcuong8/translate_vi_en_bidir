@@ -224,68 +224,9 @@ def load_model_and_tokenizer(config_path=None, model_path=None, device='cuda', s
     model.eval()
     return model, tokenizer, config_dict
 
-def encode_input(tokenizer, text, src_lang_token, device):
-    """
-    Encode input text with source language token.
-    Format: [src_lang_token] + text + [eos]
-    """
-    # Get token IDs
-    src_lang_id = tokenizer.convert_tokens_to_ids(src_lang_token)
-    
-    # Tokenize
-    tokens = tokenizer.encode(text, add_special_tokens=False)
-    
-    # Construct sequence: [src_lang_token] + tokens + [eos]
-    input_ids = [src_lang_id] + tokens + [tokenizer.eos_token_id]
-    
-    return torch.tensor(input_ids, dtype=torch.long, device=device).unsqueeze(0) # Batch size 1
-
-def greedy_decode(model, encoder_input, encoder_mask, tokenizer, tgt_lang_token, max_len, device):
-    """
-    Greedy decoding for a single sequence.
-    """
-    # Encoder
-    encoder_output, _ = model.encoder(encoder_input, mask=encoder_mask)
-    
-    # Decoder Input: [bos, tgt_lang_token]
-    tgt_lang_id = tokenizer.convert_tokens_to_ids(tgt_lang_token)
-    decoder_input = torch.tensor([[tokenizer.bos_token_id, tgt_lang_id]], dtype=torch.long, device=device)
-    
-    for _ in range(max_len):
-        # Create decoder mask (padding mask - all ones since no padding in greedy single batch)
-        # But we need to match shape expected by model: (B, 1, 1, S) or (B, S) to be converted
-        # The model's forward converts (B, S) -> (B, 1, 1, S)
-        # Here we have no padding, so mask is all ones
-        tgt_mask = torch.ones((1, decoder_input.size(1)), dtype=torch.long, device=device)
-        
-        # Decoder forward
-        # Note: model.decoder returns decoder_output. We project it using lm_head
-        decoder_output, _ = model.decoder(decoder_input, encoder_output, tgt_mask=None, src_mask=encoder_mask) # tgt_mask handled?
-        
-        # Wait, model.decoder expects tgt_mask for attention.
-        # If passed None, it might fail or assume full attention.
-        # model.py: tgt_mask = (tgt_attention_mask == 0)...
-        # In DecoderBlock: mask=tgt_mask.
-        # If we pass tgt_mask=None to decoder, it goes to AttentionBlock.
-        # AttentionBlock: mask=None.
-        # If causal_mask=True (which it is for decoder), it adds causal mask.
-        # So None is fine for greedy decode (no padding).
-        
-        prob = model.lm_head(model.norm(decoder_output[:, -1]))
-        _, next_token = torch.max(prob, dim=1)
-        next_token = next_token.item()
-        
-        decoder_input = torch.cat([decoder_input, torch.tensor([[next_token]], device=device)], dim=1)
-        
-        if next_token == tokenizer.eos_token_id:
-            break
-            
-    # Exclude BOS and Lang Token from output
-    return decoder_input.squeeze().tolist()[2:] 
-
 def batch_translate_with_dataloader(model, dataloader, tokenizer, tgt_lang_token, device, max_len=256):
     """
-    Translate using a DataLoader.
+    Translate using a DataLoader with model.generate().
     Returns predictions and references.
     """
     model.eval()
@@ -298,46 +239,31 @@ def batch_translate_with_dataloader(model, dataloader, tokenizer, tgt_lang_token
         for batch in tqdm(dataloader, desc="Translating"):
             src_inputs = batch["src_input_ids"].to(device)
             src_masks = batch["src_attention_mask"].to(device)
-            src_texts = batch["src_text"]
             ref_texts = batch["tgt_text"]
             
             # Save references
             references.extend(ref_texts)
             
-            # Encoder
-            enc_mask_expanded = (src_masks == 0).unsqueeze(1).unsqueeze(2)
-            encoder_output, _ = model.encoder(src_inputs, mask=enc_mask_expanded)
-            
-            # Greedy Decode
+            # Prepare start tokens: [BOS, tgt_lang_token]
             batch_size = src_inputs.size(0)
-            decoder_input = torch.tensor(
-                [[tokenizer.bos_token_id, tgt_token_id]] * batch_size, 
-                dtype=torch.long, 
+            tgt_start_ids = torch.tensor(
+                [[tokenizer.bos_token_id, tgt_token_id]] * batch_size,
+                dtype=torch.long,
                 device=device
             )
             
-            finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
+            # Generate translations using model.generate()
+            generated = model.generate(
+                src_input_ids=src_inputs,
+                src_attention_mask=src_masks,
+                tgt_start_ids=tgt_start_ids,
+                max_len=max_len,
+                eos_token_id=tokenizer.eos_token_id
+            )
             
-            for _ in range(max_len):
-                decoder_output, _ = model.decoder(
-                    decoder_input, 
-                    encoder_output, 
-                    tgt_mask=None, 
-                    src_mask=enc_mask_expanded
-                )
-                
-                logits = model.lm_head(model.norm(decoder_output[:, -1]))
-                next_tokens = torch.argmax(logits, dim=-1)
-                
-                finished |= (next_tokens == tokenizer.eos_token_id)
-                decoder_input = torch.cat([decoder_input, next_tokens.unsqueeze(1)], dim=1)
-                
-                if finished.all():
-                    break
-            
-            # Decode to text
-            for seq in decoder_input:
-                tokens = seq[2:].tolist()
+            # Decode to text (skip BOS and lang token, stop at EOS)
+            for seq in generated:
+                tokens = seq[2:].tolist()  # Skip [BOS, lang_token]
                 try:
                     eos_index = tokens.index(tokenizer.eos_token_id)
                     tokens = tokens[:eos_index]

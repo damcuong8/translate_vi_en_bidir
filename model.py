@@ -154,11 +154,56 @@ class RotaryEmbedding(nn.Module):
         key: torch.Tensor,
         position_ids: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Extend cache if position_ids exceed current cache size
+        max_pos = position_ids.max().item()
+        if max_pos >= self.cos_cached.size(0):
+            self._extend_cache(max_pos + 1)
         
         query = _apply_rotary_emb(query, self.cos_cached, self.sin_cached, position_ids)
         key = _apply_rotary_emb(key, self.cos_cached, self.sin_cached, position_ids)
 
         return query, key
+    
+    def _extend_cache(self, new_length: int):
+        """Extend RoPE cache to accommodate longer sequences."""
+        # Compute new frequencies (same logic as __init__)
+        d_half = self.head_dim // 2
+        freq = self.base ** (
+            -torch.arange(0, d_half, dtype=torch.float32, device=self.device) / d_half
+        )
+        
+        if self.ntk_alpha != 1.0:
+            low = (
+                d_half
+                * math.log(self.initial_context_length / (self.ntk_beta * math.pi))
+                / math.log(self.base)
+            )
+            high = (
+                d_half
+                * math.log(self.initial_context_length / (self.ntk_alpha * math.pi))
+                / math.log(self.base)
+            )
+            interpolation = 1.0 / (self.scaling_factor * freq)
+            extrapolaton = 1.0 / freq
+            ramp = (
+                torch.arange(0, d_half, dtype=torch.float32, device=freq.device) - low
+            ) / (high - low)
+            mask = 1 - ramp.clamp(0, 1)
+            inv_freq = (1 - mask) * interpolation + mask * extrapolaton
+            concentration = 1.0
+        else:
+            concentration = 1.0
+            inv_freq = 1.0 / freq
+        
+        # Create cache for new length
+        t = torch.arange(new_length, dtype=torch.float32, device=self.device)
+        freqs = torch.einsum("i, j -> ij", t, inv_freq)
+        cos = freqs.cos() * concentration
+        sin = freqs.sin() * concentration
+        
+        # Update cached values
+        self.register_buffer("cos_cached", cos, persistent=False)
+        self.register_buffer("sin_cached", sin, persistent=False)
 
 # TODO code switch type of sdpa FA or torch sdpa
 class AttentionBlock(nn.Module):
@@ -719,6 +764,69 @@ class Transformer(nn.Module):
         loss_lm = F.cross_entropy(logits.view(-1, self.config.vocab_size), labels.view(-1))
         
         return logits, loss_lm, encoder_aux_loss, decoder_aux_loss
+    
+    @torch.no_grad()
+    def generate(
+        self,
+        src_input_ids: torch.LongTensor,
+        src_attention_mask: torch.LongTensor,
+        tgt_start_ids: torch.LongTensor,
+        max_len: int = 256,
+        eos_token_id: int = 2,
+    ) -> torch.LongTensor:
+        """
+        Greedy generation with batch support.
+        
+        Args:
+            src_input_ids: Source input IDs (B, S)
+            src_attention_mask: Source attention mask (B, S), 1=valid, 0=pad
+            tgt_start_ids: Starting tokens for target (B, T), e.g., [BOS, lang_token]
+            max_len: Maximum generation length
+            eos_token_id: EOS token ID to stop generation
+            
+        Returns:
+            Generated sequences (B, T') where T' <= max_len
+        """
+        batch_size = src_input_ids.size(0)
+        device = src_input_ids.device
+        
+        # Prepare source mask
+        src_mask = (src_attention_mask == 0).unsqueeze(1).unsqueeze(2)  # (B, 1, 1, S)
+        
+        # Encode source once
+        encoder_output, _ = self.encoder(src_input_ids, mask=src_mask)
+        
+        # Initialize decoder input with start tokens
+        decoder_input = tgt_start_ids  # (B, T_start)
+        
+        # Track which sequences have finished
+        finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
+        
+        # Autoregressive generation
+        for _ in range(max_len):
+            # Decode current sequence
+            decoder_output, _ = self.decoder(
+                decoder_input, 
+                encoder_output, 
+                tgt_mask=None,  # Causal mask applied internally
+                src_mask=src_mask
+            )
+            
+            # Project last token to vocabulary
+            logits = self.lm_head(self.norm(decoder_output[:, -1]))  # (B, V)
+            next_tokens = torch.argmax(logits, dim=-1)  # (B,)
+            
+            # Mark finished sequences
+            finished |= (next_tokens == eos_token_id)
+            
+            # Append next tokens
+            decoder_input = torch.cat([decoder_input, next_tokens.unsqueeze(1)], dim=1)
+            
+            # Stop if all sequences finished
+            if finished.all():
+                break
+        
+        return decoder_input
 
 def build_transformer(
     config: ModelConfig,
