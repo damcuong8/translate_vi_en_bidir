@@ -96,6 +96,7 @@ def _ensure_torch_checkpoint(path: str) -> str:
         return path
 
     if os.path.isdir(path):
+        # First try the original location
         candidate = os.path.join(path, "pytorch_model.bin")
         if os.path.isfile(candidate):
             return candidate
@@ -109,15 +110,31 @@ def _ensure_torch_checkpoint(path: str) -> str:
 
         if has_dcp:
             print("  Detected DCP checkpoint; converting to pytorch_model.bin ...")
+            
+            # Create a writable location for the converted checkpoint
+            # Use /tmp on Kaggle or other read-only systems
+            writable_dir = "/tmp/converted_checkpoints"
+            os.makedirs(writable_dir, exist_ok=True)
+            
+            # Create a unique filename based on the checkpoint path
+            checkpoint_name = os.path.basename(path.rstrip('/'))
+            candidate_writable = os.path.join(writable_dir, f"{checkpoint_name}_pytorch_model.bin")
+            
+            # Check if already converted
+            if os.path.isfile(candidate_writable):
+                print(f"  ✓ Using cached converted checkpoint at {candidate_writable}")
+                return candidate_writable
+            
             try:
                 # Use torch's built-in dcp_to_torch_save function
                 # Load state dict from DCP and save to torch format
+                print(f"  Converting to {candidate_writable}")
                 dcp_to_torch_save(
                     dcp_checkpoint_dir=path,
-                    torch_save_path=candidate,
+                    torch_save_path=candidate_writable,
                 )
-                print(f"  ✓ Materialized Torch checkpoint at {candidate}")
-                return candidate
+                print(f"  ✓ Materialized Torch checkpoint at {candidate_writable}")
+                return candidate_writable
             except Exception as exc:
                 print(f"  ❌ Failed to convert DCP checkpoint: {exc}")
                 import traceback
