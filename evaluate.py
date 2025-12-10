@@ -8,7 +8,7 @@ import hashlib
 from pathlib import Path
 from typing import List, Optional
 from torch.utils.data import Dataset, DataLoader
-from torch.distributed.checkpoint import dcp_to_torch_save
+from torch.distributed.checkpoint.format_utils import dcp_to_torch_save
 from datasets import load_from_disk
 
 from model import build_transformer, ModelConfig
