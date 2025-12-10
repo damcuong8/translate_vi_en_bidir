@@ -122,7 +122,7 @@ def get_kaggle_config():
         "save_total_limit": 5,  # Keep only last N checkpoints
         "save_optimizer_state": True,  # Include optimizer/scheduler in checkpoint
         
-        # FSDP Config
+        # FSDP Config   
         "sharding_strategy": "SHARD_GRAD_OP",
         "cpu_offload": True,
         "use_mixed_precision": False,

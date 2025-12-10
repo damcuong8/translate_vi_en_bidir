@@ -227,26 +227,29 @@ def train_fsdp(config: Optional[dict] = None):
                 max_gen_len = 152
                 
                 with autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
-                    # Encode
-                    src_mask = (src_attention_mask == 0).unsqueeze(1).unsqueeze(2)
-                    encoder_output, _ = model.encoder(src_input_ids, mask=src_mask)
-                    
-                    decoder_input = tgt_start_ids
-                    
-                    # Fixed-step generation loop for FSDP synchronization
-                    for _ in range(max_gen_len):
-                        decoder_output, _ = model.decoder(
-                            decoder_input,
-                            encoder_output,
-                            tgt_mask=None,
-                            src_mask=src_mask
-                        )
+                    # Summon full params for root FSDP (embedding, lm_head, etc)
+                    # recurse=False ensures we don't load all blocks into memory at once
+                    with FSDP.summon_full_params(model):
+                        # Encode
+                        src_mask = (src_attention_mask == 0).unsqueeze(1).unsqueeze(2)
+                        encoder_output, _ = model.encoder(src_input_ids, mask=src_mask)
                         
-                        # Project to vocab
-                        logits = model.lm_head(model.norm(decoder_output[:, -1]))
-                        next_tokens = torch.argmax(logits, dim=-1)
+                        decoder_input = tgt_start_ids
                         
-                        decoder_input = torch.cat([decoder_input, next_tokens.unsqueeze(1)], dim=1)
+                        # Fixed-step generation loop for FSDP synchronization
+                        for _ in range(max_gen_len):
+                            decoder_output, _ = model.decoder(
+                                decoder_input,
+                                encoder_output,
+                                tgt_mask=None,
+                                src_mask=src_mask
+                            )
+                            
+                            # Project to vocab
+                            logits = model.lm_head(model.norm(decoder_output[:, -1]))
+                            next_tokens = torch.argmax(logits, dim=-1)
+                            
+                            decoder_input = torch.cat([decoder_input, next_tokens.unsqueeze(1)], dim=1)
                 
                 generated_ids = decoder_input
                 
