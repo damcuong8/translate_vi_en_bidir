@@ -320,7 +320,7 @@ def train_fsdp(config: Optional[dict] = None):
             batch = {k: v.to(local_rank) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
             
             # --- DEBUG: Inspect Training Data ---
-            if rank == 0 and step == 0 and epoch == 0:
+            if rank == 0 and step % 5 == 0:
                 logger.info("\n--- DEBUG: First Batch Training Data ---")
                 logger.info(f"Src IDs: {batch['src_input_ids'][0].tolist()}")
                 logger.info(f"Tgt IDs: {batch['tgt_input_ids'][0].tolist()}")

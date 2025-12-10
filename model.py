@@ -156,8 +156,6 @@ class RotaryEmbedding(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Extend cache if position_ids exceed current cache size
         max_pos = position_ids.max().item()
-        if max_pos >= self.cos_cached.size(0):
-            self._extend_cache(max_pos + 1, query.device)
         
         # Ensure cache is on the same device as query
         cos = self.cos_cached.to(query.device)
@@ -168,46 +166,6 @@ class RotaryEmbedding(nn.Module):
 
         return query, key
     
-    def _extend_cache(self, new_length: int, device: torch.device):
-        """Extend RoPE cache to accommodate longer sequences."""
-        # Compute new frequencies (same logic as __init__)
-        d_half = self.head_dim // 2
-        freq = self.base ** (
-            -torch.arange(0, d_half, dtype=torch.float32, device=device) / d_half
-        )
-        
-        if self.ntk_alpha != 1.0:
-            low = (
-                d_half
-                * math.log(self.initial_context_length / (self.ntk_beta * math.pi))
-                / math.log(self.base)
-            )
-            high = (
-                d_half
-                * math.log(self.initial_context_length / (self.ntk_alpha * math.pi))
-                / math.log(self.base)
-            )
-            interpolation = 1.0 / (self.scaling_factor * freq)
-            extrapolaton = 1.0 / freq
-            ramp = (
-                torch.arange(0, d_half, dtype=torch.float32, device=device) - low
-            ) / (high - low)
-            mask = 1 - ramp.clamp(0, 1)
-            inv_freq = (1 - mask) * interpolation + mask * extrapolaton
-            concentration = 1.0
-        else:
-            concentration = 1.0
-            inv_freq = 1.0 / freq
-        
-        # Create cache for new length
-        t = torch.arange(new_length, dtype=torch.float32, device=device)
-        freqs = torch.einsum("i, j -> ij", t, inv_freq)
-        cos = freqs.cos() * concentration
-        sin = freqs.sin() * concentration
-        
-        # Update cached values
-        self.register_buffer("cos_cached", cos, persistent=False)
-        self.register_buffer("sin_cached", sin, persistent=False)
 
 # TODO code switch type of sdpa FA or torch sdpa
 class AttentionBlock(nn.Module):
@@ -291,8 +249,6 @@ class AttentionBlock(nn.Module):
                 seq_len = x.shape[1]
                 causal_mask = torch.triu(torch.ones((seq_len, seq_len), device=x.device), diagonal=1).bool()
                 mask = mask | causal_mask
-                print(f"Causal mask: {causal_mask}")
-                print(f"Mask: {mask}")
             is_causal = False
 
         if self.config.use_sdpa_kernel:
