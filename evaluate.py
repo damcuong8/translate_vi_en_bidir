@@ -236,11 +236,20 @@ def batch_translate_with_dataloader(model, dataloader, tokenizer, tgt_lang_token
     tgt_token_id = tokenizer.convert_tokens_to_ids(tgt_lang_token)
     
     with torch.no_grad():
-        for batch in tqdm(dataloader, desc="Translating"):
+        for i, batch in enumerate(tqdm(dataloader, desc="Translating")):
             src_inputs = batch["src_input_ids"].to(device)
             src_masks = batch["src_attention_mask"].to(device)
             ref_texts = batch["tgt_text"]
             
+            # --- DEBUG: Inspect Evaluation Data ---
+            if i == 0:
+                print("\n--- DEBUG: First Evaluation Batch ---")
+                print(f"Src IDs: {src_inputs[0].tolist()}")
+                print(f"Src Text (Decoded): {tokenizer.decode(src_inputs[0], skip_special_tokens=False)}")
+                print(f"Ref Text (Original): {ref_texts[0]}")
+                print("-------------------------------------\n")
+            # --------------------------------------
+
             # Save references
             references.extend(ref_texts)
             
@@ -375,24 +384,80 @@ def evaluate_direction(model, tokenizer, config, dataset_path, src_lang, tgt_lan
     print(f"WER: {metrics['wer']:.4f}")
     print(f"CER: {metrics['cer']:.4f}")
     
-    # Save examples
+    # Save results
     output_dir = Path("evaluation_results")
     output_dir.mkdir(exist_ok=True)
     timestamp = time.strftime("%Y%m%d-%H%M%S")
-    out_path = output_dir / f"eval_{src_lang}_{tgt_lang}_{timestamp}.txt"
     
-    # Get some examples for output
-    example_sources = []
-    for i in range(min(10, len(eval_dataset))):
+    # Get all sources for output
+    all_sources = []
+    for i in range(len(eval_dataset)):
         item = eval_dataset[i]
-        example_sources.append(item["src_text"])
+        all_sources.append(item["src_text"])
     
-    with open(out_path, 'w', encoding='utf-8') as f:
-        f.write(f"Metrics:\nBLEU: {metrics['bleu']}\nWER: {metrics['wer']}\nCER: {metrics['cer']}\n\n")
-        f.write("Examples:\n")
+    # Save all predictions to text file
+    pred_file = output_dir / f"predictions_{src_lang}_{tgt_lang}_{timestamp}.txt"
+    with open(pred_file, 'w', encoding='utf-8') as f:
+        for pred in predictions:
+            f.write(pred + "\n")
+    print(f"Saved predictions to {pred_file}")
+    
+    # Save all references to text file
+    ref_file = output_dir / f"references_{src_lang}_{tgt_lang}_{timestamp}.txt"
+    with open(ref_file, 'w', encoding='utf-8') as f:
+        for ref in references:
+            f.write(ref + "\n")
+    print(f"Saved references to {ref_file}")
+    
+    # Save all sources to text file
+    src_file = output_dir / f"sources_{src_lang}_{tgt_lang}_{timestamp}.txt"
+    with open(src_file, 'w', encoding='utf-8') as f:
+        for src in all_sources:
+            f.write(src + "\n")
+    print(f"Saved sources to {src_file}")
+    
+    # Save summary with metrics and examples
+    summary_file = output_dir / f"summary_{src_lang}_{tgt_lang}_{timestamp}.txt"
+    with open(summary_file, 'w', encoding='utf-8') as f:
+        f.write(f"Evaluation Summary: {src_lang} -> {tgt_lang}\n")
+        f.write(f"Timestamp: {timestamp}\n")
+        f.write(f"Total samples: {len(predictions)}\n")
+        f.write(f"\nMetrics:\n")
+        f.write(f"BLEU: {metrics['bleu']:.4f}\n")
+        f.write(f"WER: {metrics['wer']:.4f}\n")
+        f.write(f"CER: {metrics['cer']:.4f}\n")
+        f.write(f"\n{'='*80}\n")
+        f.write(f"Sample Examples (first 10):\n")
+        f.write(f"{'='*80}\n\n")
         for i in range(min(10, len(predictions))):
-            f.write(f"Src: {example_sources[i]}\nRef: {references[i]}\nPred: {predictions[i]}\n\n")
-    print(f"Saved details to {out_path}")
+            f.write(f"Example {i+1}:\n")
+            f.write(f"Source:     {all_sources[i]}\n")
+            f.write(f"Reference:  {references[i]}\n")
+            f.write(f"Prediction: {predictions[i]}\n")
+            f.write(f"{'-'*80}\n\n")
+    print(f"Saved summary to {summary_file}")
+    
+    # Save as JSON for easy parsing
+    results_json = {
+        "direction": f"{src_lang}->{tgt_lang}",
+        "timestamp": timestamp,
+        "total_samples": len(predictions),
+        "metrics": {
+            "bleu": float(metrics['bleu']),
+            "wer": float(metrics['wer']),
+            "cer": float(metrics['cer'])
+        },
+        "files": {
+            "predictions": str(pred_file),
+            "references": str(ref_file),
+            "sources": str(src_file),
+            "summary": str(summary_file)
+        }
+    }
+    json_file = output_dir / f"results_{src_lang}_{tgt_lang}_{timestamp}.json"
+    with open(json_file, 'w', encoding='utf-8') as f:
+        json.dump(results_json, f, indent=2, ensure_ascii=False)
+    print(f"Saved JSON results to {json_file}")
 
 def main():
     parser = argparse.ArgumentParser()

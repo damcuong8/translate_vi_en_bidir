@@ -319,6 +319,20 @@ def train_fsdp(config: Optional[dict] = None):
         for step, batch in enumerate(train_pbar):
             batch = {k: v.to(local_rank) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
             
+            # --- DEBUG: Inspect Training Data ---
+            if rank == 0 and step == 0 and epoch == 0:
+                logger.info("\n--- DEBUG: First Batch Training Data ---")
+                logger.info(f"Src IDs: {batch['src_input_ids'][0].tolist()}")
+                logger.info(f"Tgt IDs: {batch['tgt_input_ids'][0].tolist()}")
+                logger.info(f"Src Text (Decoded): {tokenizer.decode(batch['src_input_ids'][0], skip_special_tokens=False)}")
+                logger.info(f"Tgt Text (Decoded): {tokenizer.decode(batch['tgt_input_ids'][0], skip_special_tokens=False)}")
+                if 'src_text' in batch:
+                    logger.info(f"Src Text (Original): {batch['src_text'][0]}")
+                if 'tgt_text' in batch:
+                    logger.info(f"Tgt Text (Original): {batch['tgt_text'][0]}")
+                logger.info("----------------------------------------\n")
+            # ------------------------------------
+
             # Determine if we are accumulating gradients (no sync)
             is_accumulating = (step + 1) % gradient_accumulation_steps != 0
             
