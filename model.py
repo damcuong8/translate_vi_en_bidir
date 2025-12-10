@@ -291,6 +291,8 @@ class AttentionBlock(nn.Module):
                 seq_len = x.shape[1]
                 causal_mask = torch.triu(torch.ones((seq_len, seq_len), device=x.device), diagonal=1).bool()
                 mask = mask | causal_mask
+                print(f"Causal mask: {causal_mask}")
+                print(f"Mask: {mask}")
             is_causal = False
 
         if self.config.use_sdpa_kernel:
