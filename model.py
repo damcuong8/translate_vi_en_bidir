@@ -157,19 +157,23 @@ class RotaryEmbedding(nn.Module):
         # Extend cache if position_ids exceed current cache size
         max_pos = position_ids.max().item()
         if max_pos >= self.cos_cached.size(0):
-            self._extend_cache(max_pos + 1)
+            self._extend_cache(max_pos + 1, query.device)
         
-        query = _apply_rotary_emb(query, self.cos_cached, self.sin_cached, position_ids)
-        key = _apply_rotary_emb(key, self.cos_cached, self.sin_cached, position_ids)
+        # Ensure cache is on the same device as query
+        cos = self.cos_cached.to(query.device)
+        sin = self.sin_cached.to(query.device)
+        
+        query = _apply_rotary_emb(query, cos, sin, position_ids)
+        key = _apply_rotary_emb(key, cos, sin, position_ids)
 
         return query, key
     
-    def _extend_cache(self, new_length: int):
+    def _extend_cache(self, new_length: int, device: torch.device):
         """Extend RoPE cache to accommodate longer sequences."""
         # Compute new frequencies (same logic as __init__)
         d_half = self.head_dim // 2
         freq = self.base ** (
-            -torch.arange(0, d_half, dtype=torch.float32, device=self.device) / d_half
+            -torch.arange(0, d_half, dtype=torch.float32, device=device) / d_half
         )
         
         if self.ntk_alpha != 1.0:
@@ -186,7 +190,7 @@ class RotaryEmbedding(nn.Module):
             interpolation = 1.0 / (self.scaling_factor * freq)
             extrapolaton = 1.0 / freq
             ramp = (
-                torch.arange(0, d_half, dtype=torch.float32, device=freq.device) - low
+                torch.arange(0, d_half, dtype=torch.float32, device=device) - low
             ) / (high - low)
             mask = 1 - ramp.clamp(0, 1)
             inv_freq = (1 - mask) * interpolation + mask * extrapolaton
@@ -196,7 +200,7 @@ class RotaryEmbedding(nn.Module):
             inv_freq = 1.0 / freq
         
         # Create cache for new length
-        t = torch.arange(new_length, dtype=torch.float32, device=self.device)
+        t = torch.arange(new_length, dtype=torch.float32, device=device)
         freqs = torch.einsum("i, j -> ij", t, inv_freq)
         cos = freqs.cos() * concentration
         sin = freqs.sin() * concentration
