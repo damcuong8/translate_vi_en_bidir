@@ -5,7 +5,7 @@ import sys
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, required=True, help="Path to training config json")
+    parser.add_argument("--config", type=str, required=False, help="Path to training config json")
     parser.add_argument("--ds_config", type=str, required=False, help="Path to deepspeed config json")
     parser.add_argument("--local_rank", type=int, default=0,
                         help="local GPU rank supplied by DeepSpeed launcher")

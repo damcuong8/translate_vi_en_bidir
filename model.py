@@ -247,6 +247,7 @@ class AttentionBlock(nn.Module):
                 mask = mask | causal_mask
             is_causal = False
             attn_mask = ~mask
+            print(attn_mask)
 
         if self.config.use_sdpa_kernel:
             with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
