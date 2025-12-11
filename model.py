@@ -39,6 +39,7 @@ class ModelConfig:
     w_aux_loss: float = 0.001
     use_deepspeed_moe: bool = False
     use_fsdp_moe: bool = True
+    label_smoothing: float = 0.1
 
 
 class RMSNorm(nn.Module):
@@ -247,6 +248,8 @@ class AttentionBlock(nn.Module):
                 mask = mask | causal_mask
             is_causal = False
             attn_mask = ~mask
+            print(attn_mask)
+            print(is_causal)
 
         if self.config.use_sdpa_kernel:
             with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
@@ -721,7 +724,12 @@ class Transformer(nn.Module):
         decoder_output, decoder_aux_loss = self.decoder(tgt_input_ids, encoder_output, tgt_mask=tgt_mask, src_mask=src_mask)
         logits = self.lm_head(self.norm(decoder_output))
 
-        loss_lm = F.cross_entropy(logits.view(-1, self.config.vocab_size), labels.view(-1))
+        loss_lm = F.cross_entropy(
+            logits.view(-1, self.config.vocab_size),
+            labels.view(-1),
+            label_smoothing=self.config.label_smoothing,
+            ignore_index=-100
+        )
         
         return logits, loss_lm, encoder_aux_loss, decoder_aux_loss
     

@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 import sys
+import wandb
 
 def main():
     parser = argparse.ArgumentParser()
@@ -10,9 +11,7 @@ def main():
     parser.add_argument("--local_rank", type=int, default=0,
                         help="local GPU rank supplied by DeepSpeed launcher")
     
-    # We parse known args to get config paths, but we also want to pass args to the called functions if needed.
-    # However, the called functions in the other files accept config objects, not args.
-    # But if we run them as scripts, they parse args.
+    wandb.login(key="d5f9bf0b4e6741e7f8daf108d0e2b8efdcc23eb1")
     
     args = parser.parse_args()
 

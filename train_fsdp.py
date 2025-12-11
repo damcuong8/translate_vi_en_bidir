@@ -139,7 +139,19 @@ def train_fsdp(config: Optional[dict] = None):
 
 
     if config['use_torch_compile']:
-        model = torch.compile(model)
+        compile_mode = config.get('torch_compile_mode', 'default')
+        compile_dynamic = config.get('torch_compile_dynamic', None)
+        compile_backend = config.get('torch_compile_backend', 'inductor')
+        
+        if rank == 0:
+            logger.info(f"Compiling model with mode={compile_mode}, dynamic={compile_dynamic}, backend={compile_backend}")
+        
+        model = torch.compile(
+            model,
+            mode=compile_mode,
+            dynamic=compile_dynamic,
+            backend=compile_backend
+        )
         if rank == 0:
             logger.info("Model compiled with torch.compile")
     else:
@@ -287,19 +299,23 @@ def train_fsdp(config: Optional[dict] = None):
                         wandb.log({
                             "validation_samples": wandb.Table(
                                 columns=["Step", "Source", "Reference", "Prediction"],
-                                data=[[curr_step, batch['src_text'][0], batch['tgt_text'][0], predictions[-bs]]]
+                                data=[[curr_step, batch['src_text'][:50], batch['tgt_text'][:50], predictions[-bs]]]
                             )
                         }, commit=False)
 
-        # Calculate Metrics
-        metrics = calculate_metrics(predictions, references)
-        
-        # Aggregate metrics across ranks?
-        # For now, just logging local rank metrics or Rank 0 metrics.
-        # Ideally we should gather all predictions. 
-        # But let's keep it simple: Rank 0 logs its metrics.
-        
+        # Gather predictions/references across ranks for global metrics
+        # Use all_gather_object to handle variable-length strings
+        gathered_preds = [None for _ in range(world_size)]
+        gathered_refs = [None for _ in range(world_size)]
+        dist.all_gather_object(gathered_preds, predictions)
+        dist.all_gather_object(gathered_refs, references)
+
         if rank == 0:
+            # Flatten lists from all ranks
+            all_predictions = [p for sub in gathered_preds for p in sub]
+            all_references = [r for sub in gathered_refs for r in sub]
+
+            metrics = calculate_metrics(all_predictions, all_references)
             logger.info(f"{desc} | BLEU: {metrics['bleu']:.4f} | SacreBLEU: {metrics['sacre_bleu']:.4f}")
             if wandb.run is not None:
                 wandb.log({
