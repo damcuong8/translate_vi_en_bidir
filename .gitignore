@@ -13,7 +13,7 @@ wandb/
 checkpoints/
 eval_results/
 flores_tokenized/
-hf_datasets_new/
+hf_dataset_new/
 output/
 Tokenizer_ENVI/
 *.env/

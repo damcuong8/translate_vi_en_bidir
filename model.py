@@ -290,15 +290,38 @@ class AttentionBlock(nn.Module):
         # Convert layout to [B, H, S, D] for SDPA
         q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
 
-        attn_mask = mask.unsqueeze(1).unsqueeze(2) if mask is not None else None
+        # Handle attention mask: combine padding mask with causal mask if needed
+        seq_len_q = q.shape[2]
+        
+        # Track if we created causal mask in attn_mask
+        created_causal_in_mask = False
+        
+        if mask is not None:
+            # Padding mask: [B, S_q] -> [B, 1, 1, S_q]
+            attn_mask = mask.unsqueeze(1).unsqueeze(2)  # [B, 1, 1, S_q]
+            
+            # Combine with causal mask if needed
+            if is_causal:
+                # Create causal mask based on query length only
+                causal_mask = torch.tril(torch.ones(seq_len_q, seq_len_q, device=q.device, dtype=torch.bool))
+                causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, S_q, S_q]
+                # Expand padding mask to match causal mask shape
+                attn_mask = attn_mask.expand(-1, -1, seq_len_q, seq_len_q)  # [B, 1, S_q, S_q]
+                # Combine: both padding and causal must be True
+                attn_mask = attn_mask & causal_mask
+                created_causal_in_mask = True
+        
+        # If we created causal mask in attn_mask, set is_causal=False to avoid double application
+        use_causal = is_causal and not created_causal_in_mask
+        
         if self.config.use_sdpa_kernel:
             with sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION):
                 out = F.scaled_dot_product_attention(
-                    q, k, v, attn_mask=attn_mask, is_causal=is_causal, scale=self.softmax_scale
+                    q, k, v, attn_mask=attn_mask, is_causal=use_causal, scale=self.softmax_scale
                 )
         else:
             out = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=attn_mask, is_causal=is_causal, scale=self.softmax_scale
+                q, k, v, attn_mask=attn_mask, is_causal=use_causal, scale=self.softmax_scale
             )
         return out.transpose(1, 2)
 
