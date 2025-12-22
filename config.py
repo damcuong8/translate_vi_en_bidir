@@ -124,7 +124,7 @@ def get_kaggle_config():
         
         # FSDP Config   
         "sharding_strategy": "SHARD_GRAD_OP",
-        "cpu_offload": True,
+        "cpu_offload": False,
         "use_mixed_precision": False,
         "mixed_precision_dtype": "fp16",
         "use_torch_compile": True,

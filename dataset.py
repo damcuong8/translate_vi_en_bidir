@@ -6,7 +6,7 @@ from datasets import load_from_disk
 
 
 class BidirectionalDataset(Dataset):
-    def __init__(self, dataset_path, tokenizer, max_seq_len=152):
+    def __init__(self, dataset_path, tokenizer, max_seq_len: int = 149):
         self.ds = load_from_disk(dataset_path)
         original_count = len(self.ds)
         print(f"Original dataset count: {original_count}")
@@ -33,7 +33,9 @@ class BidirectionalDataset(Dataset):
         print(f"Filtered dataset count: {filtered_count}")
         print(f"Removed {original_count - filtered_count} samples due to length > {max_seq_len}")
         
+        # Store tokenizer and max sequence length
         self.tokenizer = tokenizer
+        self.max_seq_len = max_seq_len
         self.real_len = len(self.ds)
         
         self.bos_id = tokenizer.bos_token_id
@@ -84,17 +86,32 @@ class BidirectionalDataset(Dataset):
         }
 
 class Collator:
-    def __init__(self, tokenizer):
+    def __init__(self, tokenizer, max_seq_len: int = 149):
         self.tokenizer = tokenizer
+        self.max_seq_len = max_seq_len + 3 # +3 for <bos>, <eos>, <lang_token>
 
     def __call__(self, batch):
         src_batch = [{"input_ids": x["src_ids"]} for x in batch]
         tgt_batch = [{"input_ids": x["tgt_ids"]} for x in batch]
         src_text = [x["src_text"] for x in batch]
         tgt_text = [x["tgt_text"] for x in batch]
-        # Padding
-        src_pad = self.tokenizer.pad(src_batch, pad_to_multiple_of=8, padding_side="right", return_attention_mask=True, return_tensors="pt")
-        tgt_pad = self.tokenizer.pad(tgt_batch, pad_to_multiple_of=8, padding_side="right", return_attention_mask=True, return_tensors="pt")
+        # Padding to fixed max_seq_len
+        src_pad = self.tokenizer.pad(
+            src_batch,
+            padding="max_length",
+            max_length=self.max_seq_len,
+            padding_side="right",
+            return_attention_mask=True,
+            return_tensors="pt",
+        )
+        tgt_pad = self.tokenizer.pad(
+            tgt_batch,
+            padding="max_length",
+            max_length=self.max_seq_len,
+            padding_side="right",
+            return_attention_mask=True,
+            return_tensors="pt",
+        )
 
         # Masks
         src_mask = src_pad["attention_mask"].long()

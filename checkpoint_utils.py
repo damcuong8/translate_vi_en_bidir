@@ -863,6 +863,93 @@ def _cleanup_old_checkpoints(config: Union[Dict, object], checkpoint_dir: Option
                 logger.warning(f"Failed to remove old checkpoint {old_path}: {e}")
 
 
+def _convert_scalar_to_1d_tensor(state_dict: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Convert scalar tensors to 1D tensors for FSDP compatibility.
+    This handles the case where old checkpoints have scalar parameters that need to be 1D tensors.
+    
+    Args:
+        state_dict: Model state dict that may contain scalar tensors
+        
+    Returns:
+        Modified state dict with scalar tensors converted to 1D tensors
+    """
+    converted_state_dict = {}
+    scalar_param_names = ['alpha', 'gate_scale', 'up_shift', '_gate_clamp_raw', '_up_clamp_raw']
+    converted_count = 0
+    
+    for key, value in state_dict.items():
+        # Check if this is a scalar parameter in activation modules
+        if any(param_name in key for param_name in scalar_param_names) and 'activation' in key:
+            if isinstance(value, torch.Tensor):
+                if value.dim() == 0:  # scalar tensor
+                    converted_state_dict[key] = value.unsqueeze(0)
+                    converted_count += 1
+                    logger.info(f"Converted scalar tensor to 1D: {key} (shape: {value.shape} -> {converted_state_dict[key].shape})")
+                else:
+                    converted_state_dict[key] = value
+            else:
+                converted_state_dict[key] = value
+        else:
+            converted_state_dict[key] = value
+    
+    if converted_count > 0:
+        logger.info(f"✓ Converted {converted_count} scalar parameter(s) to 1D tensors for FSDP compatibility")
+    
+    return converted_state_dict
+
+
+def _convert_optimizer_state_scalar_to_1d(optimizer_state_dict: Dict[str, Any], model) -> Dict[str, Any]:
+    """
+    Convert scalar tensors in optimizer state dict to 1D tensors for FSDP compatibility.
+    This matches optimizer state shapes to model parameter shapes.
+    
+    Args:
+        optimizer_state_dict: Optimizer state dict that may contain scalar tensors
+        model: Model instance to match parameter shapes
+        
+    Returns:
+        Modified optimizer state dict with scalar tensors converted to 1D tensors
+    """
+    if 'state' not in optimizer_state_dict:
+        return optimizer_state_dict
+    
+    # Get model parameter shapes - create a mapping from parameter to shape
+    model_params = {name: param.shape for name, param in model.named_parameters()}
+    
+    # Get parameter names in the order they appear in optimizer
+    param_names = []
+    for group in optimizer_state_dict.get('param_groups', []):
+        for param_id in group.get('params', []):
+            # param_id is an integer index, we need to map it to parameter name
+            # This is tricky - we'll use a different approach: convert all scalars that match model param shapes
+            pass
+    
+    # Simpler approach: convert all scalar tensors in optimizer state to 1D
+    # and let PyTorch handle the matching
+    converted_count = 0
+    new_state = {}
+    
+    for param_id, state in optimizer_state_dict['state'].items():
+        new_state_item = {}
+        for key, value in state.items():
+            if isinstance(value, torch.Tensor) and value.dim() == 0:
+                # Convert scalar to 1D tensor
+                new_state_item[key] = value.unsqueeze(0)
+                converted_count += 1
+                logger.debug(f"Converted optimizer state scalar to 1D: param_id={param_id}, key={key}")
+            else:
+                new_state_item[key] = value
+        new_state[param_id] = new_state_item
+    
+    if converted_count > 0:
+        logger.info(f"✓ Converted {converted_count} scalar tensor(s) in optimizer state to 1D tensors")
+        optimizer_state_dict = optimizer_state_dict.copy()
+        optimizer_state_dict['state'] = new_state
+    
+    return optimizer_state_dict
+
+
 def load_checkpoint(
     checkpoint_path: str,
     model,
@@ -972,10 +1059,12 @@ def load_checkpoint(
             meta = app_state["meta"]
             checkpoint_epoch = meta.get("epoch", 0)
             checkpoint_step = meta.get("step", 0)
+            checkpoint_global_step = meta.get("global_step", checkpoint_step)
             checkpoint_stage = meta.get("stage", None)
         else:
             checkpoint_epoch = 0
             checkpoint_step = 0
+            checkpoint_global_step = 0
             checkpoint_stage = None
         
         # Reconstruct checkpoint in regular format
@@ -992,6 +1081,7 @@ def load_checkpoint(
         # Add metadata at top level
         new_checkpoint["epoch"] = checkpoint_epoch
         new_checkpoint["step"] = checkpoint_step
+        new_checkpoint["global_step"] = checkpoint_global_step
         new_checkpoint["stage"] = checkpoint_stage
         
         checkpoint = new_checkpoint
@@ -1004,8 +1094,11 @@ def load_checkpoint(
         # The model class has _keys_to_ignore_on_load_missing = ["text_encoder", "t2u_model", "vocoder"]
         # so it will automatically skip missing text_encoder keys if present
         
+        # Convert scalar tensors to 1D tensors for FSDP compatibility (for old checkpoints)
+        model_state_dict = _convert_scalar_to_1d_tensor(checkpoint["model"])
+        
         try:
-            missing_keys, unexpected_keys = model.load_state_dict(checkpoint["model"], strict=strict)
+            missing_keys, unexpected_keys = model.load_state_dict(model_state_dict, strict=strict)
             
             # Log missing keys (excluding those in _keys_to_ignore_on_load_missing)
             if missing_keys:
@@ -1044,7 +1137,7 @@ def load_checkpoint(
                 logger.error("This may happen if checkpoint was saved with different model architecture")
                 if strict:
                     logger.info("Retrying with strict=False...")
-                    missing_keys, unexpected_keys = model.load_state_dict(checkpoint["model"], strict=False)
+                    missing_keys, unexpected_keys = model.load_state_dict(model_state_dict, strict=False)
                     logger.warning("✓ Loaded with strict=False (some keys may be missing or unexpected)")
                 else:
                     raise
@@ -1060,8 +1153,19 @@ def load_checkpoint(
     
     # Load optimizer state dict
     if optimizer is not None and "optimizer" in checkpoint:
-        optimizer.load_state_dict(checkpoint["optimizer"])
-        logger.info("✓ Optimizer state dict loaded")
+        try:
+            # Convert scalar tensors in optimizer state to 1D tensors for FSDP compatibility
+            optimizer_state_dict = _convert_optimizer_state_scalar_to_1d(checkpoint["optimizer"], model)
+            optimizer.load_state_dict(optimizer_state_dict)
+            logger.info("✓ Optimizer state dict loaded")
+        except (RuntimeError, ValueError) as e:
+            if "shape" in str(e).lower() or "broadcast" in str(e).lower() or "doesn't match" in str(e).lower():
+                logger.warning(f"⚠️  Failed to load optimizer state dict due to shape mismatch: {e}")
+                logger.warning("   This may happen if checkpoint was saved with different model architecture (scalar vs 1D tensors)")
+                logger.warning("   Optimizer state will be reinitialized - training will continue but optimizer momentum will be lost")
+                # Don't load optimizer state - let it reinitialize
+            else:
+                raise
     
     # Load scheduler state dict
     if scheduler is not None and "scheduler" in checkpoint:
@@ -1077,12 +1181,16 @@ def load_checkpoint(
             logger.warning(f"Failed to load GradScaler state dict: {e}")
     
     # Return metadata
+    # Use global_step if available, otherwise fall back to step
+    checkpoint_step = checkpoint.get("step", 0)
+    checkpoint_global_step = checkpoint.get("global_step", checkpoint_step)
     metadata = {
         "epoch": checkpoint.get("epoch", 0),
-        "step": checkpoint.get("step", 0),
+        "step": checkpoint_step,
+        "global_step": checkpoint_global_step,
         "stage": checkpoint.get("stage", None),
     }
     
-    logger.info(f"Loaded checkpoint: epoch={metadata['epoch']}, step={metadata['step']}, stage={metadata['stage']}")
+    logger.info(f"Loaded checkpoint: epoch={metadata['epoch']}, step={metadata['step']}, global_step={metadata['global_step']}, stage={metadata['stage']}")
     
     return metadata

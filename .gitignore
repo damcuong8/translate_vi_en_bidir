@@ -10,6 +10,14 @@ weights/
 
 wandb/
 
+checkpoints/
+eval_results/
+flores_tokenized/
+hf_datasets_new/
+output/
+Tokenizer_ENVI/
+*.env/
+train.sh
 venv/
 133k_en_vi/
 detokenization/

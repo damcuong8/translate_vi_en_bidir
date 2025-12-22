@@ -5,11 +5,8 @@ import sys
 import logging
 import torch
 import torch.optim as optim
-import torch.distributed as dist
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.utils.data import DataLoader
-from torch.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
-from torch.amp import autocast
+from torch.amp import autocast, GradScaler
 import wandb
 from tqdm import tqdm
 from typing import Optional
@@ -17,47 +14,126 @@ from config import get_kaggle_config
 from model import build_transformer, ModelConfig
 from dataset import BidirectionalDataset, Collator
 from transformers import AutoTokenizer
-from utils import wrap_model_with_fsdp, create_cosine_scheduler
-from checkpoint_utils import save_checkpoint, load_checkpoint
+from utils import create_cosine_scheduler
+from checkpoint_utils import load_checkpoint
 from contextlib import nullcontext
 from evaluate import calculate_metrics
 
 # Setup logging
 logger = logging.getLogger(__name__)
 
-def setup_logging(rank: int):
+def setup_logging():
     """
-    Setup logging configuration
+    Setup logging configuration for single GPU training
     """
-    # Only setup handlers for rank 0 or if needed
-    if rank != 0:
-        return
-        
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
         handlers=[
             logging.StreamHandler(sys.stdout),
-            logging.FileHandler("train_fsdp.log", mode="a", encoding="utf-8")
+            logging.FileHandler("train_single.log", mode="a", encoding="utf-8")
         ]
     )
 
-def train_fsdp(config: Optional[dict] = None):
-    # Setup distributed
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    torch.cuda.set_device(local_rank)
-    dist.init_process_group("nccl")
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
+def save_checkpoint_single(
+    model,
+    optimizer,
+    scheduler,
+    scaler,
+    epoch: int,
+    step: int,
+    config: dict,
+    global_step: Optional[int] = None,
+    tag: Optional[str] = None,
+):
+    """
+    Save checkpoint in standard PyTorch format for single GPU training.
+    Compatible with load_checkpoint() function.
+    """
+    output_dir = config.get("output_dir", "./output")
+    base_checkpoint_dir = config.get("checkpoint_path") or config.get("checkpoint_dir") or os.path.join(output_dir, "checkpoints")
+    os.makedirs(base_checkpoint_dir, exist_ok=True)
+    
+    checkpoint_step = global_step if global_step is not None else step
+    checkpoint_dir = os.path.join(base_checkpoint_dir, f"checkpoint-{checkpoint_step}")
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    
+    checkpoint_file = os.path.join(checkpoint_dir, "pytorch_model.bin")
+    
+    # Prepare checkpoint dictionary
+    checkpoint = {
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict() if config.get("save_optimizer_state", True) else None,
+        "scheduler": scheduler.state_dict() if config.get("save_optimizer_state", True) else None,
+        "scaler": scaler.state_dict() if (scaler is not None and config.get("save_optimizer_state", True)) else None,
+        "epoch": epoch,
+        "step": step,
+        "global_step": global_step if global_step is not None else step,
+    }
+    
+    if tag is not None:
+        checkpoint["stage"] = tag
+    
+    # Save checkpoint
+    logger.info(f"Saving checkpoint to {checkpoint_file}")
+    torch.save(checkpoint, checkpoint_file)
+    logger.info(f"✓ Checkpoint saved successfully to {checkpoint_dir}")
+    
+    # Cleanup old checkpoints
+    save_total_limit = config.get("save_total_limit", 3)
+    if save_total_limit > 0:
+        _cleanup_old_checkpoints(base_checkpoint_dir, checkpoint_step, save_total_limit)
 
+def _cleanup_old_checkpoints(base_checkpoint_dir: str, current_step: int, keep_latest_n: int):
+    """Remove old checkpoints, keeping only the latest N checkpoints."""
+    try:
+        checkpoints = []
+        for item in os.listdir(base_checkpoint_dir):
+            checkpoint_path = os.path.join(base_checkpoint_dir, item)
+            if os.path.isdir(checkpoint_path) and item.startswith("checkpoint-"):
+                try:
+                    step = int(item.split("-")[1])
+                    checkpoints.append((step, checkpoint_path))
+                except ValueError:
+                    continue
+        
+        # Sort by step (descending)
+        checkpoints.sort(key=lambda x: x[0], reverse=True)
+        
+        # Remove old checkpoints
+        for step, checkpoint_path in checkpoints[keep_latest_n:]:
+            if step != current_step:  # Don't remove current checkpoint
+                try:
+                    import shutil
+                    shutil.rmtree(checkpoint_path)
+                    logger.info(f"Removed old checkpoint: {checkpoint_path}")
+                except Exception as e:
+                    logger.warning(f"Failed to remove old checkpoint {checkpoint_path}: {e}")
+    except Exception as e:
+        logger.warning(f"Failed to cleanup old checkpoints: {e}")
+
+def train_single(config: Optional[dict] = None):
+    """
+    Single GPU training function.
+    No distributed setup required.
+    """
+    # Setup device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device.type == "cuda":
+        # Enable fast math on modern GPUs
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
+    
     # Setup logging
-    setup_logging(rank)
-
+    setup_logging()
+    
     if config is None:
         config = get_kaggle_config()
     
-    if rank == 0:
-        logger.info(f"Starting FSDP training with config: {json.dumps(config, indent=2, default=str)}")
+    logger.info(f"Starting single GPU training with config: {json.dumps(config, indent=2, default=str)}")
+    
+    # Load tokenizer and datasets
     tokenizer = AutoTokenizer.from_pretrained(config['tokenizer_path'])
     max_seq_len = config.get("max_seq_len", 149)
     train_dataset = BidirectionalDataset(
@@ -72,16 +148,13 @@ def train_fsdp(config: Optional[dict] = None):
     )
     collate_fn = Collator(tokenizer=tokenizer, max_seq_len=max_seq_len)
     
-    # Use DistributedSampler
-    train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset, num_replicas=world_size, rank=rank)
-    val_sampler = torch.utils.data.distributed.DistributedSampler(val_dataset, num_replicas=world_size, rank=rank)
-
+    # Create DataLoaders (no DistributedSampler needed)
     num_workers = config.get('num_workers', os.cpu_count() or 4)
-
+    
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=config['train_batch_size'],
-        sampler=train_sampler,
+        shuffle=True,  # Simple shuffle, no distributed sampler
         num_workers=num_workers,
         collate_fn=collate_fn,
         pin_memory=True,
@@ -92,66 +165,42 @@ def train_fsdp(config: Optional[dict] = None):
     val_dataloader = DataLoader(
         val_dataset,
         batch_size=config['val_batch_size'],
-        sampler=val_sampler,
+        shuffle=False,
         num_workers=num_workers,
         collate_fn=collate_fn,
         pin_memory=True,
         prefetch_factor=num_workers if num_workers > 0 else None
     )
-
+    
+    # Build model
     model_config = ModelConfig(vocab_size=tokenizer.vocab_size)
     # Update model_config with values from config if they exist
     for key, value in config.items():
         if hasattr(model_config, key):
             setattr(model_config, key, value)
-
-    model = build_transformer(config=model_config).to(local_rank)
     
-    model = wrap_model_with_fsdp(model, config)
-    fsdp_model = model
-
-    if rank == 0:
-        logger.info(f"Model wrapped with FSDP: \n{model}")
-        
-        def check_fsdp_unit(name, module):
-            is_fsdp = isinstance(module, FSDP)
-            unit_id = id(module)
-            weight_id = id(module.weight) if hasattr(module, "weight") else None
-            logger.info(f"[{name}] Is FSDP: {is_fsdp}, Unit ID: {unit_id}, Weight ID: {weight_id}")
-            return unit_id
-
-        logger.info("--- Checking FSDP Wrapping & Shared Embeddings ---")
-        shared_unit = check_fsdp_unit("Shared Embedding", model.shared)
-        
-        if hasattr(model.encoder, "embedding"):
-             enc_unit = check_fsdp_unit("Encoder Embedding", model.encoder.embedding)
-             if shared_unit != enc_unit:
-                 logger.warning(f"Warning: Shared and Encoder Embedding are different units/objects!")
-             else:
-                 logger.info("Shared and Encoder Embedding are the SAME unit/object.")
-
-        if hasattr(model.decoder, "embedding"):
-             dec_unit = check_fsdp_unit("Decoder Embedding", model.decoder.embedding)
-             if shared_unit != dec_unit:
-                 logger.warning(f"Warning: Shared and Decoder Embedding are different units/objects!")
-             else:
-                 logger.info("Shared and Decoder Embedding are the SAME unit/object.")
-
-        logger.info(f"LM Head weight pointer: {id(model.lm_head.weight)}")
-        logger.info("------------------------------------------------")
-
-
+    model = build_transformer(config=model_config).to(device)
+    
+    logger.info(f"Model created: \n{model}")
+    
+    # Optional: torch.compile
     if config.get('use_torch_compile', False):
         compile_mode = config.get('torch_compile_mode', 'default')
-        compile_dynamic = config.get('torch_compile_dynamic', None)
+        compile_dynamic = config.get('torch_compile_dynamic', True)
         compile_backend = config.get('torch_compile_backend', 'inductor')
         compile_fullgraph = config.get('torch_compile_fullgraph', False)
 
-        if rank == 0:
-            logger.info(
-                f"Compiling model with mode={compile_mode}, dynamic={compile_dynamic}, "
-                f"backend={compile_backend}, fullgraph={compile_fullgraph}"
-            )
+        # Enable capturing scalar outputs to reduce graph breaks from .item() calls
+        try:
+            import torch._dynamo.config as dynamo_config
+            dynamo_config.capture_scalar_outputs = True
+        except Exception:
+            pass  # Ignore if config not available
+
+        logger.info(
+            f"Compiling model with mode={compile_mode}, dynamic={compile_dynamic}, "
+            f"backend={compile_backend}, fullgraph={compile_fullgraph}"
+        )
 
         model = torch.compile(
             model,
@@ -160,76 +209,79 @@ def train_fsdp(config: Optional[dict] = None):
             fullgraph=compile_fullgraph,
             dynamic=compile_dynamic,
         )
-        if rank == 0:
-            logger.info("Model compiled with torch.compile")
+        logger.info("Model compiled with torch.compile")
     else:
-        if rank == 0:
-            logger.info("Model not compiled with torch.compile")
-
+        logger.info("Model not compiled with torch.compile")
+    
     # Calculate training steps
     gradient_accumulation_steps = config.get('gradient_accumulation_steps', 1)
     num_training_steps = len(train_dataloader) * config['num_epochs'] // gradient_accumulation_steps
-
+    
+    # Setup optimizer, scheduler, scaler
     optimizer = optim.AdamW(model.parameters(), **config['optimizer']['params'])
     scheduler = create_cosine_scheduler(optimizer, config, num_training_steps)
     
-    # Initialize AMP GradScaler
+    # Initialize AMP GradScaler (standard, not sharded)
     use_amp = config.get('use_amp', True)
     amp_dtype = torch.float16 if config.get('amp_dtype', 'fp16') == 'fp16' else torch.bfloat16
-    scaler = ShardedGradScaler(enabled=use_amp)
+    scaler = GradScaler(enabled=use_amp)
     
     # Gradient clipping config
     max_grad_norm = config.get('max_grad_norm', 1.0)
     
     # Checkpoint config
-    save_steps = config.get('save_steps', 500)
+    save_strategy = config.get('save_strategy', 'epoch')
+    save_steps = config.get('save_steps', None) if save_strategy == 'steps' else None
     save_total_limit = config.get('save_total_limit', 3)
     
-    if rank == 0:
-        wandb_config = config.get("wandb", {})
-        if wandb_config.get("enabled", True):
-            logger.info(f"Initializing wandb project: {wandb_config.get('project', 'Translate-Vi-En')}")
-            wandb.init(
-                project=wandb_config.get("project", "Translate-Vi-En"),
-                name=wandb_config.get("name", "fsdp_run"),
-                config=config
-            )
-        logger.info(f"==================================================")
-        logger.info(f"FSDP Training Started. World Size: {world_size}")
-        logger.info(f"AMP Enabled: {use_amp}, Dtype: {amp_dtype}")
-        logger.info(f"Gradient Clipping: max_norm={max_grad_norm}")
-        logger.info(f"Gradient Accumulation Steps: {gradient_accumulation_steps}")
-        logger.info(f"Total Training Steps: {num_training_steps}")
-        logger.info(f"Save Steps: {save_steps}, Save Total Limit: {save_total_limit}")
-        logger.info(f"==================================================")
-        if wandb.run is not None:
-             wandb.config.update({
-                 "fsdp": True,
-                 "use_amp": use_amp,
-                 "amp_dtype": str(amp_dtype),
-                 "max_grad_norm": max_grad_norm,
-                 "gradient_accumulation_steps": gradient_accumulation_steps,
-                 "save_steps": save_steps,
-                 "save_total_limit": save_total_limit,
-                 "config": config
-             }, allow_val_change=True)
-
+    # WandB initialization
+    wandb_config = config.get("wandb", {})
+    if wandb_config.get("enabled", True):
+        logger.info(f"Initializing wandb project: {wandb_config.get('project', 'Translate-Vi-En')}")
+        wandb.init(
+            project=wandb_config.get("project", "Translate-Vi-En"),
+            name=wandb_config.get("name", "single_gpu_run"),
+            config=config
+        )
+    
+    logger.info(f"==================================================")
+    logger.info(f"Single GPU Training Started")
+    logger.info(f"Device: {device}")
+    logger.info(f"AMP Enabled: {use_amp}, Dtype: {amp_dtype}")
+    logger.info(f"Gradient Clipping: max_norm={max_grad_norm}")
+    logger.info(f"Gradient Accumulation Steps: {gradient_accumulation_steps}")
+    logger.info(f"Total Training Steps: {num_training_steps}")
+    logger.info(f"Save Steps: {save_steps}, Save Total Limit: {save_total_limit}")
+    logger.info(f"==================================================")
+    
+    if wandb.run is not None:
+        wandb.config.update({
+            "single_gpu": True,
+            "use_amp": use_amp,
+            "amp_dtype": str(amp_dtype),
+            "max_grad_norm": max_grad_norm,
+            "gradient_accumulation_steps": gradient_accumulation_steps,
+            "save_steps": save_steps,
+            "save_total_limit": save_total_limit,
+            "save_strategy": save_strategy,
+            "config": config
+        }, allow_val_change=True)
+    
     # Evaluation config
-    eval_steps = config.get('eval_steps', 1000)
-
+    eval_steps = config.get('eval_steps', 5000)
+    
     # Resume logic
     start_epoch = 0
     start_global_step = 0
     resume_path = config.get('resume_from_checkpoint')
     
     if resume_path:
-        if rank == 0:
-            logger.info(f"Resuming training from checkpoint: {resume_path}")
+        logger.info(f"Resuming training from checkpoint: {resume_path}")
         
         try:
             metadata = load_checkpoint(
                 checkpoint_path=resume_path,
-                model=fsdp_model,
+                model=model,
                 optimizer=optimizer,
                 scheduler=scheduler,
                 scaler=scaler,
@@ -253,45 +305,39 @@ def train_fsdp(config: Optional[dict] = None):
                 # If we've completed the epoch (batches_in_current_epoch == 0), start from next epoch
                 if batches_in_current_epoch == 0:
                     # Completed this epoch, start from next epoch
-                    start_epoch = calculated_epoch + 1
-                    completed_epoch = calculated_epoch
+                    start_epoch = calculated_epoch
+                    completed_epoch = calculated_epoch - 1
                 else:
                     # Still in the middle of this epoch, continue from this epoch
                     start_epoch = calculated_epoch
-                    completed_epoch = calculated_epoch - 1
+                    completed_epoch = calculated_epoch
                 
-                if start_epoch != checkpoint_epoch + 1:
-                    if rank == 0:
-                        logger.info(f"Recalculating start epoch: checkpoint epoch={checkpoint_epoch}, calculated start_epoch={start_epoch} (from global_step={start_global_step}, batches_in_current_epoch={batches_in_current_epoch})")
+                if start_epoch != checkpoint_epoch:
+                    logger.info(f"Recalculating start epoch: checkpoint epoch={checkpoint_epoch}, calculated start_epoch={start_epoch} (from global_step={start_global_step}, batches_in_current_epoch={batches_in_current_epoch})")
             else:
                 # Fallback: start from checkpoint_epoch + 1 (assuming checkpoint was saved at end of epoch)
                 start_epoch = checkpoint_epoch + 1
                 completed_epoch = checkpoint_epoch
-
-            if rank == 0:
-                logger.info(f"Resumed state: Completed Epoch {completed_epoch}, Starting Epoch {start_epoch}, Global Step {start_global_step}")
+            
+            logger.info(f"Resumed state: Completed Epoch {completed_epoch}, Starting Epoch {start_epoch}, Global Step {start_global_step}")
         except Exception as e:
-            if rank == 0:
-                logger.error(f"Failed to resume from checkpoint: {e}")
+            logger.error(f"Failed to resume from checkpoint: {e}")
             raise e
-
+    
     def run_validation(curr_epoch, curr_step, is_end_of_epoch=False):
+        """Run validation without distributed gathering."""
         model.eval()
         
         # Create tqdm progress bar for validation
         desc = f"Epoch {curr_epoch} [Val]" if is_end_of_epoch else f"Step {curr_step} [Val]"
-        val_pbar = tqdm(
-            val_dataloader,
-            desc=desc,
-            disable=rank != 0
-        )
+        val_pbar = tqdm(val_dataloader, desc=desc)
         
         predictions = []
         references = []
         
         with torch.no_grad():
             for step, batch in enumerate(val_pbar):
-                batch = {k: v.to(local_rank) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+                batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
                 
                 # Validation with Generation (No Teacher Forcing)
                 src_input_ids = batch['src_input_ids']
@@ -304,44 +350,32 @@ def train_fsdp(config: Optional[dict] = None):
                 max_gen_len = 152
                 
                 with autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
-                    # Summon full params for root FSDP (embedding, lm_head, etc)
-                    # recurse=False ensures we don't load all blocks into memory at once
-                    with FSDP.summon_full_params(model):
-                        # Encode
-                        encoder_output, _ = model.encoder(src_input_ids, mask=src_attention_mask)
+                    # Encode
+                    encoder_output, _ = model.encoder(src_input_ids, mask=src_attention_mask)
+                    
+                    decoder_input = tgt_start_ids
+                    
+                    # Generation loop
+                    for _ in range(max_gen_len):
+                        decoder_output, _ = model.decoder(
+                            decoder_input,
+                            encoder_output,
+                            tgt_mask=None,
+                            src_mask=src_attention_mask
+                        )
                         
-                        decoder_input = tgt_start_ids
+                        # Project to vocab
+                        logits = model.lm_head(model.norm(decoder_output[:, -1]))
+                        next_tokens = torch.argmax(logits, dim=-1)
                         
-                        # Generation loop
-                        for _ in range(max_gen_len):
-                            decoder_output, _ = model.decoder(
-                                decoder_input,
-                                encoder_output,
-                                tgt_mask=None,
-                                src_mask=src_attention_mask
-                            )
-                            
-                            # Project to vocab
-                            logits = model.lm_head(model.norm(decoder_output[:, -1]))
-                            next_tokens = torch.argmax(logits, dim=-1)
-                            
-                            decoder_input = torch.cat([decoder_input, next_tokens.unsqueeze(1)], dim=1)
-                        
-                        # Get generated_ids inside FSDP context
-                        generated_ids = decoder_input
+                        decoder_input = torch.cat([decoder_input, next_tokens.unsqueeze(1)], dim=1)
+                
+                generated_ids = decoder_input
                 
                 # Collect predictions and references
-                # Decode on all ranks, but only rank 0 usually logs/computes metrics?
-                # Actually, to compute metrics over the whole dataset, we should gather results.
-                # For simplicity, we can just compute metrics on each rank's subset and average them,
-                # or just let Rank 0 compute metrics on its subset (if shuffled, might be representative).
-                # But Val set is usually not shuffled in distributed sampler? 
-                # DistributedSampler shuffles by default.
-                
-                # Let's decode locally
                 for i in range(bs):
                     # Prediction
-                    pred_tokens = generated_ids[i, 2:].tolist() # Skip start tokens
+                    pred_tokens = generated_ids[i, 2:].tolist()  # Skip start tokens
                     try:
                         eos_idx = pred_tokens.index(tokenizer.eos_token_id)
                         pred_tokens = pred_tokens[:eos_idx]
@@ -354,81 +388,56 @@ def train_fsdp(config: Optional[dict] = None):
                     ref_text = batch['tgt_text'][i]
                     references.append(ref_text)
                 
-                # Logging samples (Rank 0 only)
-                if rank == 0 and step % 100 == 0:
-                     logger.info(f"\nStep {step} | Src: {batch['src_text'][0]}")
-                     logger.info(f"Ref: {batch['tgt_text'][0]}")
-                     logger.info(f"Pred: {predictions[-bs]}") # Last batch first item
-                     
-                     if wandb.run is not None:
+                # Logging samples
+                if step % 100 == 0:
+                    logger.info(f"\nStep {step} | Src: {batch['src_text'][0]}")
+                    logger.info(f"Ref: {batch['tgt_text'][0]}")
+                    logger.info(f"Pred: {predictions[-bs]}")  # Last batch first item
+                    
+                    if wandb.run is not None:
                         wandb.log({
                             "validation_samples": wandb.Table(
                                 columns=["Step", "Source", "Reference", "Prediction"],
                                 data=[[curr_step, batch['src_text'][:50], batch['tgt_text'][:50], predictions[-bs]]]
                             )
                         }, commit=False)
-
-        # Gather predictions/references across ranks for global metrics
-        # Use all_gather_object to handle variable-length strings
-        gathered_preds = [None for _ in range(world_size)]
-        gathered_refs = [None for _ in range(world_size)]
-        dist.all_gather_object(gathered_preds, predictions)
-        dist.all_gather_object(gathered_refs, references)
-
-        if rank == 0:
-            # Flatten lists from all ranks
-            all_predictions = [p for sub in gathered_preds for p in sub]
-            all_references = [r for sub in gathered_refs for r in sub]
-
-            metrics = calculate_metrics(all_predictions, all_references)
-            bleu_score = metrics['bleu']['score'] if isinstance(metrics['bleu'], dict) else metrics['bleu']
-            chrf_score = metrics['chrf_plus']['score'] if isinstance(metrics['chrf_plus'], dict) else metrics.get('chrf_plus', 0.0)
-            logger.info(f"{desc} | BLEU: {bleu_score:.4f} | chrF++: {chrf_score:.4f}")
-            if wandb.run is not None:
-                wandb.log({
-                    "eval_bleu": bleu_score,
-                    "eval_chrf_plus": chrf_score,
-                    "epoch": curr_epoch,
-                    "global_step": curr_step
-                })
+        
+        # Calculate metrics directly (no gathering needed for single GPU)
+        metrics = calculate_metrics(predictions, references)
+        logger.info(f"{desc} | BLEU: {metrics['bleu']['score']:.4f} | chrF++: {metrics['chrf_plus']['score']:.4f}")
+        
+        if wandb.run is not None:
+            wandb.log({
+                "eval_bleu": metrics['bleu']['score'],
+                "eval_chrf_plus": metrics['chrf_plus']['score'],
+                "epoch": curr_epoch,
+                "global_step": curr_step
+            })
         
         model.train()
-
+    
+    # Training loop
     global_step = start_global_step
     for epoch in range(start_epoch, config['num_epochs']):
-        train_sampler.set_epoch(epoch)
         model.train()
         
-        # Calculate skip batches for the starting epoch
-        batches_to_skip = 0
-        if epoch == start_epoch:
-            batches_per_epoch = len(train_dataloader)
-            total_micro_batches_done = start_global_step * gradient_accumulation_steps
-            # Calculate how many micro-batches have been processed in the current epoch
-            batches_in_current_epoch = total_micro_batches_done % batches_per_epoch
-            batches_to_skip = batches_in_current_epoch
-            if rank == 0 and batches_to_skip > 0:
-                logger.info(f"Skipping first {batches_to_skip} micro-batches in Epoch {epoch} (already processed {batches_in_current_epoch}/{batches_per_epoch} batches in this epoch)")
-
+        # Skip batches logic temporarily removed - batch size may have changed
+        # TODO: Re-implement skip logic if needed with correct batch size calculation
+        
         # Create tqdm progress bar for training
-        train_pbar = tqdm(
-            train_dataloader,
-            desc=f"Epoch {epoch} [Train]",
-            disable=rank != 0
-        )
+        train_pbar = tqdm(train_dataloader, desc=f"Epoch {epoch} [Train]")
         
         optimizer.zero_grad()
         accumulated_loss = 0.0
         
         for step, batch in enumerate(train_pbar):
-            if step < batches_to_skip:
-                continue
-            batch = {k: v.to(local_rank) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-
-            # Determine if we are accumulating gradients (no sync)
+            batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+            
+            # Determine if we are accumulating gradients
             is_accumulating = (step + 1) % gradient_accumulation_steps != 0
             
-            with fsdp_model.no_sync() if is_accumulating else nullcontext():
+            # Use nullcontext instead of fsdp_model.no_sync() for single GPU
+            with nullcontext():
                 # Forward pass with AMP autocast
                 with autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
                     # Mark step boundary for CUDA graphs when using torch.compile
@@ -440,12 +449,15 @@ def train_fsdp(config: Optional[dict] = None):
                         except Exception:
                             pass
 
+                    # Determine if this is the final batch in effective batch
+                    is_final = not is_accumulating
                     logits, loss_lm, enc_aux_loss, dec_aux_loss = model(
                         batch['src_input_ids'], 
                         batch['src_attention_mask'], 
                         batch['tgt_input_ids'], 
                         batch['tgt_attention_mask'], 
-                        batch['labels']
+                        batch['labels'],
+                        is_final=is_final
                     )
                     total_loss = loss_lm + enc_aux_loss + dec_aux_loss
                     # Scale loss for gradient accumulation
@@ -497,8 +509,8 @@ def train_fsdp(config: Optional[dict] = None):
                     })
                 
                 # Save checkpoint at regular intervals
-                if global_step > 0 and global_step % save_steps == 0:
-                    save_checkpoint(
+                if save_steps is not None and global_step > 0 and global_step % save_steps == 0:
+                    save_checkpoint_single(
                         model=model,
                         optimizer=optimizer,
                         scheduler=scheduler,
@@ -506,23 +518,28 @@ def train_fsdp(config: Optional[dict] = None):
                         epoch=epoch,
                         step=global_step,
                         global_step=global_step,
-                        config=config,
-                        rank=rank
+                        config=config
                     )
-                    # Sync all ranks after checkpoint
-                    if dist.is_available() and dist.is_initialized():
-                        dist.barrier()
                 
                 # Evaluate at regular intervals
                 if global_step > 0 and global_step % eval_steps == 0:
                     run_validation(epoch, global_step)
-
-                accumulated_loss = 0.0
+        
+        # Handle remaining accumulated gradients at end of epoch
+        if accumulated_loss > 0:
+            # Perform final optimizer step with remaining gradients
+            scaler.unscale_(optimizer)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+            scaler.step(optimizer)
+            scaler.update()
+            scheduler.step()
+            optimizer.zero_grad()
+            global_step += 1
         
         run_validation(epoch, global_step, is_end_of_epoch=True)
         
         # Save checkpoint at end of epoch
-        save_checkpoint(
+        save_checkpoint_single(
             model=model,
             optimizer=optimizer,
             scheduler=scheduler,
@@ -531,23 +548,16 @@ def train_fsdp(config: Optional[dict] = None):
             step=global_step,
             global_step=global_step,
             config=config,
-            rank=rank,
             tag=f"epoch-{epoch}"
         )
-        # Sync all ranks after checkpoint
-        if dist.is_available() and dist.is_initialized():
-            dist.barrier()
-
-    dist.destroy_process_group()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, required=True)
-    parser.add_argument("--local_rank", type=int, default=0)
     args = parser.parse_args()
-
+    
     with open(args.config) as f:
         config = json.load(f)
-
-    train_fsdp(config=config)
+    
+    train_single(config=config)
 
