@@ -1,140 +1,81 @@
-# Vietnamese-Lao Neural Machine Translation
+# English ↔ Vietnamese Transformer (FSDP + MoE)
 
-A Transformer-based neural machine translation system for Vietnamese-Lao language pair, optimized for datasets with ~100K sentence pairs. This project implements a full sequence-to-sequence Transformer architecture with dynamic batching, mixed precision training, and beam search decoding.
+Hệ thống dịch máy Anh–Việt/Việt–Anh xây dựng trên Transformer tùy biến, hỗ trợ FSDP, MoE, torch.compile, AMP và beam search. Pipeline làm việc trực tiếp với tập dữ liệu đã token hóa ở định dạng Hugging Face `load_from_disk`.
 
-## Model Architecture
+## Kiến trúc & tính năng chính
+- **Transformer encoder/decoder tùy biến:** 12 encoder layer, 9 decoder layer, hidden 512, head dim 64, 8 heads. RMSNorm, RoPE, label smoothing 0.06.
+- **Mixture-of-Experts (MoE):** 16 expert, top‑2; hỗ trợ FSDP MoE hoặc DeepSpeed MoE, shared embedding và tie weights.
+- **Tăng tốc:** AMP (fp16/bf16), optional FlashAttention/SDPA kernel, torch.compile, gradient accumulation, gradient clipping.
+- **Huấn luyện phân tán:** FSDP (mặc định), DDP hoặc DeepSpeed Zero-2; checkpoint có thể ở dạng DCP và được tự xử lý/convert.
+- **Scheduler:** Cosine decay + warmup, AdamW; log với W&B.
+- **Sinh chuỗi:** Greedy hoặc beam search (length penalty) qua `Transformer.generate`.
 
-- **Transformer:** 4-layer encoder-decoder architecture
-- **Dimensions:** 384d model size, 8 attention heads, 1536d feed-forward network
-- **Regularization:** Dropout (0.15), word dropout, label smoothing (0.1)
-- **Tokenization:** SentencePiece subword tokenization 
-- **Optimizer:** AdamW with weight decay (0.01) and gradient clipping (1.0)
-- **Learning rate:** Cosine schedule with linear warmup (4000 steps)
+## Yêu cầu
+```
+pip install -r requirements.txt
+```
+Thêm `sentencepiece`, `sacrebleu`, `comet-ml` nếu cần đánh giá đầy đủ.
 
-## Features
+## Dữ liệu & tokenizer
+- Tokenizer Hugging Face tại `tokenizer_path` (mặc định `./Tokenizer_ENVI/`), chứa token ngôn ngữ `__eng__`, `__vie__`.
+- Tập dữ liệu dùng `load_from_disk`, mỗi mẫu cần các trường:
+  - `input_ids_en`, `input_ids_vi`, `en`, `vi`
+- Lớp `BidirectionalDataset` nhân đôi mẫu theo hai hướng và thêm lang-token ở đầu chuỗi; lọc mẫu dài hơn `max_seq_len` (mặc định 149) và cache tại `/tmp/translate_vi_en_cache`.
+- `Collator` padding về bội số 8, trả về `src_input_ids`, `tgt_input_ids`, mask và `labels` cho LM loss.
 
-- **Dynamic batching** with on-the-fly padding for efficient training
-- **Mixed precision training** for faster computation
-- **Distributed training** with multi-GPU support using DistributedDataParallel
-- **Gradient accumulation** for effective larger batch sizes
-- **Early stopping** based on BLEU, WER, or CER metrics
-- **Comprehensive evaluation** with multiple metrics
-- **Beam search decoding** for better translation quality
-- **Checkpointing system** (epoch/step/best model saving)
+## Cấu hình huấn luyện
+- File mặc định: `train_config.json`. Các khóa quan trọng:
+  - `use_single_gpu` / `use_fsdp` / `use_ddp` / `use_deepspeed`
+  - Batch size per GPU (`train_batch_size`, …), `gradient_accumulation_steps`
+  - Optimizer/scheduler (AdamW + WarmupCosine), `use_amp`, `amp_dtype`
+  - FSDP: `sharding_strategy`, `use_mixed_precision`, `cpu_offload`, `use_torch_compile`
+  - Đường dẫn dữ liệu/tokenizer/checkpoint, `lang_token_map`
+- Nếu muốn cấu hình nhanh cho Kaggle, xem hàm `get_kaggle_config()` trong `config.py`.
 
-
-## Usage
-
-### Training
+## Chạy huấn luyện
+`train.py` tự chọn chế độ theo config/flag.
 
 ```bash
-# Basic training
-python train.py
+# FSDP nhiều GPU (khuyến nghị)
+torchrun --nproc_per_node=4 train.py --config train_config.json
 
-# Advanced training options
-python train.py --batch_size 32 --epochs 30 --distributed
+# Một GPU
+python train.py --config train_config.json --single_gpu
+
+# DeepSpeed Zero-2
+deepspeed --num_gpus=4 train.py --config train_config.json --ds_config deepspeed_config.json
+
+# Resume
+torchrun --nproc_per_node=4 train.py --config train_config.json --resume_from_checkpoint checkpoints/checkpoint-xxxxx
 ```
 
-### Translation
+Checkpoint được lưu định kỳ (`save_steps`) và cuối mỗi epoch vào `checkpoint_path`. `checkpoint_utils.py` hỗ trợ lưu/khôi phục (kể cả DCP).
 
+## Đánh giá & suy luận hàng loạt
+`evaluate.py` tải mô hình, tự chuyển đổi DCP nếu cần, sinh bản dịch bằng `model.generate`, tính BLEU/chrF++ và (tùy chọn) COMET, lưu kết quả vào `evaluation_results/`.
+
+Ví dụ:
 ```bash
-# Translate a single sentence with beam search
-python translate.py --text "Tôi yêu đất nước Việt Nam" --beam 5
-
-# Translate a file
-python translate.py --source input.vi --output output.lo --model vi_lo_weights/tmodel_best.pt --beam 3
-
-# Interactive mode
-python translate.py --interactive --beam 5
+python evaluate.py \
+  --config train_config.json \
+  --checkpoint checkpoints/checkpoint-131410 \
+  --dataset_path ./flores_tokenized/flores_devtest \
+  --beam_size 5 \
+  --length_penalty 1.0 \
+  --bidirectional True
 ```
+Kết quả gồm: CSV predictions/references/sources và file JSON/summary với BLEU, chrF++, COMET (nếu tải được).
 
-### Evaluation
+## Suy luận nhanh (gợi ý)
+- Dùng `evaluate.load_model_and_tokenizer` để tải checkpoint và tokenizer, sau đó gọi `model.generate` với `tgt_start_ids = [[bos, lang_token]]`.
+- Script `translate.py` là phiên bản cũ (không theo mô hình hiện tại); ưu tiên dùng pipeline trong `evaluate.py`.
 
-Evaluate on test set with BLEU, WER, and CER metrics:
-
-```bash
-python evaluate.py --test_file path/to/test.vi --reference path/to/reference.lo
-```
-
-## Configuration
-
-Key configuration parameters in `config.py`:
-
-```python
-{
-    # Training parameters
-    "batch_size": 16,         # Per GPU batch size
-    "num_epochs": 20,
-    "lr": 5e-4,
-    "warmup_steps": 4000,
-    "gradient_clip_val": 1.0,
-    "weight_decay": 0.01,
-    "label_smoothing": 0.1,
-    
-    # Model architecture
-    "d_model": 384,           # Model dimension
-    "num_layers": 4,          # Number of encoder/decoder layers
-    "num_heads": 8,           # Number of attention heads
-    "dropout": 0.15,
-    "d_ff": 1536,             # Feed-forward dimension
-    
-    # Advanced features
-    "distributed_training": True,
-    "word_dropout_rate": 0.1,
-    "use_mixed_precision": True,
-    
-    # Early stopping
-    "early_stopping": True,
-    "early_stopping_metric": "bleu",
-    "early_stopping_patience": 10,
-}
-```
-
-## Beam Search
-
-The implementation includes beam search decoding to improve translation quality. Key features:
-
-- Maintains multiple translation candidates at each step
-- Length normalization to avoid bias toward shorter sequences
-- Configurable beam size (default: 5)
-
-Example usage:
-
-```bash
-# Use beam search with size 5
-python translate.py --text "Hôm nay trời đẹp" --beam 5
-```
-
-## Performance
-
-On a dataset of ~100K Vietnamese-Lao sentence pairs:
-
-| Metric | Score |
-|--------|-------|
-| BLEU   | 28.7  |
-| WER    | 0.44  |
-| CER    | 0.32  |
-
-Training time: ~3 hours on a single NVIDIA T4 GPU.
-
-## Distributed Training
-
-For multi-GPU training, the system automatically detects available GPUs and distributes the workload:
-
-```bash
-# Enable distributed training on all available GPUs
-python train.py
-
-# Specify number of GPUs to use
-CUDA_VISIBLE_DEVICES=0,1 python train.py
-```
-
-## License
-
-This project is licensed under the MIT License - see the LICENSE file for details.
-
-## Acknowledgments
-
-- Based on the Transformer architecture from "Attention Is All You Need" (Vaswani et al., 2017)
-- Optimized for Vietnamese-Lao translation as part of the VLSP 2023 shared task
+## Thư mục chính
+- `train.py`: bộ chọn chế độ huấn luyện (single/FSDP/DDP/DeepSpeed).
+- `train_fsdp.py`, `train_ddp.py`, `train_deepspeed.py`, `train_single.py`: logic huấn luyện cụ thể.
+- `model.py`: định nghĩa Transformer + MoE, generate (greedy/beam).
+- `dataset.py`: `BidirectionalDataset`, `Collator`.
+- `checkpoint_utils.py`: lưu/khôi phục, hỗ trợ DCP.
+- `evaluate.py`: suy luận + tính BLEU/chrF++/COMET.
+- `train_config.json`: cấu hình mẫu.
 

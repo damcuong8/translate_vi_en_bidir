@@ -98,17 +98,17 @@ class Collator:
         # Padding to fixed max_seq_len
         src_pad = self.tokenizer.pad(
             src_batch,
-            padding="max_length",
-            max_length=self.max_seq_len,
+            padding=True,
             padding_side="right",
+            pad_to_multiple_of=8,
             return_attention_mask=True,
             return_tensors="pt",
         )
         tgt_pad = self.tokenizer.pad(
             tgt_batch,
-            padding="max_length",
-            max_length=self.max_seq_len,
+            padding=True,
             padding_side="right",
+            pad_to_multiple_of=8,
             return_attention_mask=True,
             return_tensors="pt",
         )
